@@ -85,6 +85,10 @@ class AdapterSpec:
     id: str
     label: str
     binary: str
+    # PATH 上找不到 binary 時依序嘗試的絕對路徑（支援 ~）。
+    # 實際需求：pi 裝在 ~/.hermes/node/bin 底下，那個目錄不在使用者的 PATH 上。
+    # 與其去動使用者的 shell 設定，不如讓 adapter 自己宣告候選位置。
+    binary_candidates: list[str] = field(default_factory=list)
     argv: list[Any] = field(default_factory=list)
     # prompt 怎麼交給 CLI：argv（當成參數，用 {{ prompt }} 佔位）或 stdin
     prompt_delivery: str = "argv"
@@ -113,9 +117,15 @@ class AdapterSpec:
     def defaults(self) -> dict[str, Any]:
         return {f.name: f.default for f in self.fields}
 
-    def build_argv(self, variables: dict[str, Any]) -> list[str]:
-        """依 argv 規格與變數組出實際的指令列。"""
-        out: list[str] = [self.binary]
+    def build_argv(
+        self, variables: dict[str, Any], binary: str | None = None
+    ) -> list[str]:
+        """依 argv 規格與變數組出實際的指令列。
+
+        binary 可覆寫 argv[0] —— registry 解析出實際可執行檔的位置後傳進來
+        （PATH 上找不到時會退回 binary_candidates）。
+        """
+        out: list[str] = [binary or self.binary]
 
         for entry in self.argv:
             if isinstance(entry, str):

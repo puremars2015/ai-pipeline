@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,16 +42,28 @@ def check_adapters() -> list[str]:
 
     print("== Adapter / CLI ==")
     for spec in registry.all():
-        if not registry.is_installed(spec):
+        # 用解析後的路徑，不是 yaml 裡的名字 —— 有些 CLI（例如 pi）裝在不在
+        # PATH 上的目錄，靠 adapter 的 binary_candidates 才找得到。
+        resolved = registry.resolve_binary(spec)
+        if resolved is None:
             mark = WARN if spec.kind == "mock" else BAD
             print(f" {mark} {spec.label:22} 找不到指令: {spec.binary}")
             if spec.kind != "mock":
-                problems.append(f"{spec.id}: {spec.binary} 未安裝")
+                problems.append(f"{spec.id}: 找不到 {spec.binary}")
             continue
 
-        code, out = _run([spec.binary, "--version"])
+        code, out = _run([resolved, "--version"])
+        if code != 0:
+            print(f" {WARN} {spec.label:22} 找到了但問不出版本 (exit {code})")
+            print(f"     {resolved}")
+            if out:
+                print(f"     {out.splitlines()[0][:100]}")
+            problems.append(f"{spec.id}: {resolved} 無法執行")
+            continue
+
         version = out.splitlines()[0] if out else "?"
-        print(f" {OK} {spec.label:22} {version}")
+        note = "" if resolved == shutil.which(spec.binary) else f"  ({resolved})"
+        print(f" {OK} {spec.label:22} {version}{note}")
 
     return problems
 

@@ -112,9 +112,14 @@ def execute(
     timeout_sec: int,
     kill_grace: int = 10,
     last_message_file: Path | None = None,
+    binary: str | None = None,
 ) -> NodeResult:
-    """跑一個節點到結束，過程中把事件透過 emit 送出。"""
-    argv = spec.build_argv(variables)
+    """跑一個節點到結束，過程中把事件透過 emit 送出。
+
+    binary 是 registry 解析出來的實際執行檔路徑（PATH 找不到時會用 adapter
+    宣告的候選位置）。
+    """
+    argv = spec.build_argv(variables, binary=binary)
     cwd = spec.build_cwd(variables)
 
     emit(ev(STATUS, f"執行 {' '.join(argv[:4])}…", phase="spawn", argv=argv, cwd=cwd))

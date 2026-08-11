@@ -88,9 +88,81 @@ def test_invalid_spec_fields():
 
 def test_registry_loads_shipped_adapters():
     r = Registry()
-    assert {"codex", "claude", "opencode", "shell", "mock"} <= set(
+    assert {"codex", "claude", "opencode", "pi", "shell", "mock"} <= set(
         s.id for s in r.all()
     )
+
+
+def test_binary_candidates_used_when_not_on_path(tmp_path):
+    """PATH 上找不到時要退回 adapter 宣告的候選絕對路徑。
+
+    真實需求：pi 裝在 ~/.hermes/node/bin，那個目錄不在使用者的 PATH 上。
+    """
+    fake = tmp_path / "bin" / "notonpath"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+
+    (tmp_path / "a.yaml").write_text(
+        yaml.safe_dump({
+            "id": "custom", "binary": "definitely-not-on-path-xyz",
+            "binary_candidates": ["/nope/missing", str(fake)],
+        })
+    )
+    r = Registry(tmp_path)
+    spec = r.get("custom")
+    assert r.resolve_binary(spec) == str(fake)
+    assert r.is_installed(spec) is True
+    assert spec.build_argv({}, binary=str(fake)) == [str(fake)]
+
+
+def test_resolve_binary_returns_none_when_nothing_found(tmp_path):
+    (tmp_path / "a.yaml").write_text(
+        yaml.safe_dump({"id": "ghost", "binary": "definitely-not-on-path-xyz",
+                        "binary_candidates": ["/nope/missing"]})
+    )
+    r = Registry(tmp_path)
+    assert r.resolve_binary(r.get("ghost")) is None
+    assert r.is_installed(r.get("ghost")) is False
+
+
+def test_binary_candidates_ignores_non_executable(tmp_path):
+    plain = tmp_path / "plain.txt"
+    plain.write_text("not executable")
+    (tmp_path / "a.yaml").write_text(
+        yaml.safe_dump({"id": "x", "binary": "definitely-not-on-path-xyz",
+                        "binary_candidates": [str(plain)]})
+    )
+    assert Registry(tmp_path).resolve_binary(Registry(tmp_path).get("x")) is None
+
+
+def test_pi_argv():
+    s = Registry().get("pi")
+    argv = s.build_argv({**s.defaults(), "workdir": "/wt", "prompt": "P"})
+    assert argv == ["pi", "-p", "--mode", "json", "P"]
+    # pi 沒有指定工作目錄的旗標，只認 cwd
+    assert s.build_cwd({"workdir": "/wt"}) == "/wt"
+    assert "/wt" not in argv
+
+    full = s.build_argv({
+        **s.defaults(), "workdir": "/wt", "prompt": "P",
+        "provider": "anthropic", "model": "claude-sonnet-4-5",
+        "thinking": "high", "tools": "read,grep", "session_id": "sess-1",
+    })
+    assert full == [
+        "pi", "-p", "--mode", "json", "P",
+        "--provider", "anthropic", "--model", "claude-sonnet-4-5",
+        "--thinking", "high", "--tools", "read,grep", "--session-id", "sess-1",
+    ]
+
+
+def test_pi_is_resolvable_on_this_machine():
+    """pi 實際裝在這台機器上（透過 binary_candidates 找到），只是不在 PATH 上。"""
+    r = Registry()
+    resolved = r.resolve_binary(r.get("pi"))
+    if resolved is None:
+        pytest.skip("這台機器沒有安裝 pi")
+    assert resolved.endswith("/pi")
 
 
 def test_registry_rejects_unknown_yaml_key(tmp_path):

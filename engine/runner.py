@@ -411,6 +411,13 @@ class Runner:
 
     def _spawn(self, node, spec, normalizer, variables, prompt, timeout,
                last_message_file) -> NodeResult:
+        binary = self.registry.resolve_binary(spec)
+        if binary is None:
+            raise RunAborted(
+                f"節點「{node.label}」找不到可執行檔 {spec.binary}。"
+                f"請確認它已安裝且在 PATH 上（或在 adapters/{spec.id}.yaml 的 "
+                f"binary_candidates 加上實際路徑）。"
+            )
         return execute(
             spec=spec,
             normalizer=normalizer,
@@ -421,6 +428,7 @@ class Runner:
             timeout_sec=timeout,
             kill_grace=self.guards.kill_grace_seconds,
             last_message_file=last_message_file,
+            binary=binary,
         )
 
     def _refresh_diff(self) -> None:

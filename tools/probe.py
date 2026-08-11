@@ -58,12 +58,13 @@ def probe(adapter_id: str, prompt: str, workdir: Path | None = None) -> Path:
 
     scratch = workdir or make_scratch_repo()
     variables = {
-        "workdir": str(scratch),
-        "prompt": prompt,
         **spec.defaults(),
+        "workdir": str(scratch),
+        "tool_root": str(ROOT),
+        "prompt": prompt,
     }
 
-    argv = spec.build_argv(variables)
+    argv = spec.build_argv(variables, binary=registry.resolve_binary(spec))
     cwd = spec.build_cwd(variables) or str(scratch)
 
     print(f"→ 場地: {scratch}")
@@ -72,7 +73,6 @@ def probe(adapter_id: str, prompt: str, workdir: Path | None = None) -> Path:
 
     stdin_data = prompt if spec.prompt_delivery == "stdin" else None
 
-    out_path = FIXTURES / f"{adapter_id}.jsonl"
     err_path = FIXTURES / f"{adapter_id}.stderr.txt"
     FIXTURES.mkdir(parents=True, exist_ok=True)
 
@@ -103,14 +103,26 @@ def probe(adapter_id: str, prompt: str, workdir: Path | None = None) -> Path:
         stderr = proc.stderr.read() if proc.stderr else ""
         code = proc.wait()
 
+    # 失敗的探測不要蓋掉既有的 fixture。實際踩過：pi 因為沒有憑證而失敗，
+    # 只吐出一行 session 標頭，把原本完整的 fixture 整份蓋掉了。
+    if code == 0:
+        out_path = FIXTURES / f"{adapter_id}.jsonl"
+    else:
+        out_path = FIXTURES / f"{adapter_id}.failed.jsonl"
+
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if stderr.strip():
         err_path.write_text(stderr, encoding="utf-8")
 
     print(f"\n→ exit code: {code}")
     print(f"→ 已存: {out_path} ({len(lines)} 行)")
+    if code != 0:
+        good = FIXTURES / f"{adapter_id}.jsonl"
+        print(f"  ⚠ 探測失敗，沒有覆蓋 {good.name}"
+              + ("（它本來就不存在）" if not good.exists() else "（保留原本那份）"))
     if stderr.strip():
         print(f"→ stderr: {err_path}")
+        print(f"  {stderr.strip().splitlines()[0][:120]}")
     print(f"→ hello.txt 存在: {(scratch / 'hello.txt').exists()}")
 
     summarize(out_path)

@@ -15,6 +15,7 @@ import pytest
 from adapters.normalizers import claude as claude_norm
 from adapters.normalizers import codex as codex_norm
 from adapters.normalizers import opencode as opencode_norm
+from adapters.normalizers import pi as pi_norm
 from engine.events import (
     ALL_KINDS,
     ERROR,
@@ -69,6 +70,9 @@ ALL_NORMALIZERS = [
     (codex_norm, "codex.jsonl"),
     (claude_norm, "claude.jsonl"),
     (opencode_norm, "opencode.jsonl"),
+    # pi.jsonl 只有第一行是實跑抓的，其餘依 docs/json.md 與 pi-ai 的 types.d.ts
+    # 構造（本機沒設定 provider 憑證）。詳見 tests/fixtures/README.md。
+    (pi_norm, "pi.jsonl"),
 ]
 
 
@@ -293,3 +297,124 @@ def test_opencode_tool_call_before_result():
     events = run_fixture(opencode_norm.normalize, "opencode.jsonl")
     order = kinds(events)
     assert order.index(TOOL_CALL) < order.index(TOOL_RESULT)
+
+
+# ---------------------------------------------------------------- pi
+
+
+def test_pi_session_id_from_real_probe():
+    """session 標頭是實跑抓的，id 就是續接用的 session id。"""
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+    header = json.loads((FIXTURES / "pi.jsonl").read_text("utf-8").splitlines()[0])
+    assert header["type"] == "session"
+    assert session_id_of(events) == header["id"]
+    assert first(events, STATUS)["data"]["cwd"] == header["cwd"]
+
+
+def test_pi_maps_real_events():
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+
+    call = first(events, TOOL_CALL)
+    assert call["data"]["tool"] == "write"
+    assert "hello.txt" in call["text"]
+
+    assert first(events, TOOL_RESULT)["data"]["tool"] == "write"
+    assert "hello.txt" in first(events, FILE_EDIT)["data"]["paths"][0]
+    assert "done" in collect_text(events)
+
+
+def test_pi_usage_uses_pi_field_names():
+    """pi 的 Usage 是 input/output/cacheRead/cacheWrite/totalTokens/cost.total，
+    欄位名跟其他三家都不一樣，要正確映射成統一的名字。"""
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+    usage = first(events, USAGE)["data"]
+    assert usage["input_tokens"] == 1520
+    assert usage["output_tokens"] == 48
+    assert usage["reasoning_output_tokens"] == 12
+    assert usage["total_tokens"] == 1568
+    assert usage["total_cost_usd"] > 0
+    assert usage["provider"] == "google"
+
+
+def test_pi_ignores_delta_and_duplicate_events():
+    """message_update 是純增量、agent_end/turn_end 重複已送過的訊息 —— 都要忽略，
+    否則同一段文字會出現好幾次，事件流也會被洗爆。"""
+    assert pi_norm.normalize({"type": "message_update",
+                              "assistantMessageEvent": {"type": "text_delta",
+                                                        "contentIndex": 0,
+                                                        "delta": "abc"}}) == []
+    assert pi_norm.normalize({"type": "tool_execution_update"}) == []
+    assert pi_norm.normalize({"type": "message_start", "message": {}}) == []
+    assert pi_norm.normalize({"type": "turn_end", "message": {}, "toolResults": []}) == []
+    assert pi_norm.normalize({"type": "agent_end", "messages": []}) == []
+    assert pi_norm.normalize({"type": "queue_update"}) == []
+
+    # 同一段文字只能出現一次
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+    assert [e["text"] for e in events if e["kind"] == MESSAGE].count("done") == 1
+
+
+def test_pi_tool_call_not_duplicated_by_message_end():
+    """assistant 的 content 裡有 toolCall block，tool_execution_start 也會送一次。
+    只能算一次，否則 UI 時間軸會看到每個工具呼叫都出現兩遍。"""
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+    assert kinds(events).count(TOOL_CALL) == 1
+    assert kinds(events).count(FILE_EDIT) == 1
+
+
+def test_pi_thinking_becomes_reasoning():
+    events = run_fixture(pi_norm.normalize, "pi.jsonl")
+    assert "write" in first(events, "reasoning")["text"]
+
+
+def test_pi_noauth_fixture_is_header_only():
+    """實測：憑證未設定時 JSON 串流只有 session 標頭，錯誤在 stderr、exit 1。
+
+    所以節點失敗判定不能只靠事件流裡有沒有 error 事件 —— 一定要看 exit code。
+    """
+    events = run_fixture(pi_norm.normalize, "pi.noauth.jsonl")
+    assert kinds(events) == [STATUS]
+    assert ERROR not in kinds(events)
+    assert USAGE not in kinds(events)
+    assert session_id_of(events)
+
+
+def test_pi_tool_error_surfaces():
+    out = pi_norm.normalize({
+        "type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash",
+        "result": {"output": "command not found"}, "isError": True,
+    })
+    assert out[0]["kind"] == TOOL_RESULT
+    assert out[0]["data"]["is_error"] is True
+
+
+def test_pi_file_edit_comes_from_start_not_end():
+    """tool_execution_end 沒有 args，拿不到路徑，所以 file_edit 只能在 start 發。"""
+    start = pi_norm.normalize({
+        "type": "tool_execution_start", "toolCallId": "t1", "toolName": "write",
+        "args": {"path": "a.py", "absolutePath": "/wt/a.py", "content": "x"},
+    })
+    assert kinds(start) == [TOOL_CALL, FILE_EDIT]
+    assert start[1]["data"]["paths"] == ["/wt/a.py"]
+
+    end = pi_norm.normalize({
+        "type": "tool_execution_end", "toolCallId": "t1", "toolName": "write",
+        "result": {"output": "ok"}, "isError": False,
+    })
+    assert kinds(end) == [TOOL_RESULT], "end 不該再發一次 file_edit"
+
+    # 唯讀工具不算檔案改動
+    read = pi_norm.normalize({
+        "type": "tool_execution_start", "toolCallId": "t2", "toolName": "read",
+        "args": {"path": "a.py"},
+    })
+    assert kinds(read) == [TOOL_CALL]
+
+
+def test_pi_assistant_error_message():
+    out = pi_norm.normalize({
+        "type": "message_end",
+        "message": {"role": "assistant", "content": [], "usage": {},
+                    "errorMessage": "context length exceeded"},
+    })
+    assert first(out, ERROR)["text"] == "context length exceeded"

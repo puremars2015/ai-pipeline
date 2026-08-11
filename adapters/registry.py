@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -20,6 +21,7 @@ _SPEC_KEYS = {
     "id",
     "label",
     "binary",
+    "binary_candidates",
     "argv",
     "prompt_delivery",
     "cwd",
@@ -94,8 +96,23 @@ class Registry:
         self._normalizers[spec.normalizer] = func
         return func
 
+    def resolve_binary(self, spec: AdapterSpec) -> str | None:
+        """找出實際要執行的檔案。PATH 優先，其次是 adapter 宣告的候選絕對路徑。
+
+        候選路徑是為了 pi 這種情況：它裝在 ~/.hermes/node/bin，而那個目錄不在
+        使用者的 PATH 上。動使用者的 shell 設定不是我們該做的事。
+        """
+        found = shutil.which(spec.binary)
+        if found:
+            return found
+        for candidate in spec.binary_candidates:
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+        return None
+
     def is_installed(self, spec: AdapterSpec) -> bool:
-        return shutil.which(spec.binary) is not None
+        return self.resolve_binary(spec) is not None
 
     def availability(self) -> dict[str, bool]:
         return {spec.id: self.is_installed(spec) for spec in self.all()}

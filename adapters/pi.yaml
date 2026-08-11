@@ -1,0 +1,68 @@
+id: pi
+label: pi (Earendil)
+description: |
+  @earendil-works/pi-coding-agent。工具集是 read / write / edit / bash / grep，
+  provider 可自由選（預設 google）。需要先設定憑證：pi auth check --provider <name>
+  可確認，未設定時會直接以 exit 1 結束並在 stderr 說明。
+binary: pi
+# pi 常常裝在自帶的 node 發行版底下，那些目錄未必在 PATH 上。
+# 這裡列出候選位置，免得因為 PATH 沒設好就整個用不了。
+binary_candidates:
+  - "~/.hermes/node/bin/pi"
+  - "~/.bun/bin/pi"
+  - "~/.local/bin/pi"
+  - "/opt/homebrew/bin/pi"
+kind: agent
+mutates: true
+supports_schema: false
+
+prompt_delivery: argv
+
+# pi 沒有指定工作目錄的旗標，只認 cwd（session 標頭會回報它看到的 cwd）。
+cwd: "{{ workdir }}"
+
+argv:
+  - -p
+  - --mode
+  - json
+  - "{{ prompt }}"
+  - { flag: ["--provider", "{{ provider }}"] }
+  - { flag: ["--model", "{{ model }}"] }
+  - { flag: ["--thinking", "{{ thinking }}"] }
+  - { flag: ["--tools", "{{ tools }}"] }
+  - { flag: ["--exclude-tools", "{{ exclude_tools }}"] }
+  - { flag: ["--session-id", "{{ session_id }}"] }
+
+resume:
+  argv: [-p, --mode, json, "{{ prompt }}", --session, "{{ session_id }}"]
+
+events: jsonl
+normalizer: pi
+
+fields:
+  - name: provider
+    type: text
+    label: Provider
+    default: ""
+    help: 留空用 pi 預設（google）。憑證未設定會直接失敗。
+  - name: model
+    type: text
+    label: 模型
+    default: ""
+    help: 支援 "provider/id" 與 ":<thinking>" 後綴。留空用預設。
+  - name: thinking
+    type: select
+    label: 思考強度
+    default: ""
+    options: ["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    help: 留空用模型預設。
+  - name: tools
+    type: text
+    label: 只啟用這些工具
+    default: ""
+    help: 逗號分隔白名單，例如 read,grep。做唯讀審查節點時很有用（配合 mutates=false）。
+  - name: exclude_tools
+    type: text
+    label: 停用這些工具
+    default: ""
+    help: 逗號分隔黑名單，例如 bash。
