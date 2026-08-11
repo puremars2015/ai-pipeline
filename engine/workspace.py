@@ -120,15 +120,26 @@ class Workspace:
     def workdir(self) -> Path:
         return self.path
 
+    def _mark_untracked(self) -> None:
+        """把未追蹤的新檔案標成 intent-to-add。
+
+        沒有這一步，`git diff` 完全看不到新增的檔案 —— agent 最常做的事就是
+        新增檔案，而 QA 節點是靠 diff 來審查的。少了這步，QA 會對著一份空 diff
+        說「沒問題」。
+        """
+        _git(["add", "-A", "-N"], cwd=self.path, check=False)
+
     def diff(self) -> str:
-        """相對於 run 起始 commit 的完整 diff（含尚未 commit 的變更）。
+        """相對於 run 起始 commit 的完整 diff（含已 commit 與尚未 commit 的變更）。
 
         刻意回傳字串而不寫進工作目錄 —— 舊 bash 把 changes.diff commit 進 repo，
         導致下一輪的 diff 包含上一輪的 diff，內容平方成長。
         """
+        self._mark_untracked()
         return _git(["diff", self.base_sha], cwd=self.path).stdout
 
     def changed_files(self) -> list[str]:
+        self._mark_untracked()
         out = _git(["diff", "--name-only", self.base_sha], cwd=self.path).stdout
         return [line for line in out.splitlines() if line]
 

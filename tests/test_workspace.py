@@ -178,6 +178,33 @@ def test_commit_returns_none_when_no_changes(tmp_path):
         ws.remove()
 
 
+def test_diff_includes_untracked_new_files(tmp_path):
+    """新增的檔案必須出現在 diff 裡。
+
+    `git diff` 預設完全看不到未追蹤的檔案，而「新增檔案」正是 agent 最常做的事。
+    少了 intent-to-add，QA 節點會對著一份空 diff 說「沒問題」。
+    """
+    repo = make_repo(tmp_path / "proj")
+    ws = create_workspace(
+        project_repo=repo,
+        worktree_root=tmp_path / "wt",
+        main_branch="main",
+        run_id="untracked",
+        tool_root=tmp_path / "tool",
+    )
+    try:
+        (ws.path / "brand_new.py").write_text("print('hi')\n")
+        assert ws.changed_files() == ["brand_new.py"]
+        assert "brand_new.py" in ws.diff()
+        assert "print('hi')" in ws.diff()
+
+        # commit 之後仍然看得到（相對於 run 起始點）
+        ws.commit("add file")
+        assert "brand_new.py" in ws.diff()
+    finally:
+        ws.remove()
+
+
 def test_diff_is_not_written_into_worktree(tmp_path):
     """舊 bash 的 2 號 bug：changes.diff 被 commit 進 repo 造成 diff 遞迴膨脹。"""
     repo = make_repo(tmp_path / "proj")
