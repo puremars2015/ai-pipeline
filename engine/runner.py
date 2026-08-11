@@ -100,6 +100,19 @@ class Runner:
         self.artifacts = artifacts_dir
         self.cancel = cancel or threading.Event()
 
+        # 內部名稱唯一性在 validate() 也檢查，但那是可選的呼叫 —— 直接建
+        # Runner 就能繞過。碰撞的後果是兩個節點共用同一個 worktree，後建的會
+        # 強制移除還在執行中的那個，所以這裡也擋一次。
+        seen: dict[str, str] = {}
+        for node_id in graph.nodes:
+            safe = g.safe_name(node_id)
+            if safe in seen:
+                raise ValueError(
+                    f"節點 {node_id!r} 與 {seen[safe]!r} 會對應到同一個內部名稱 "
+                    f"{safe}，工作目錄會互相覆蓋"
+                )
+            seen[safe] = node_id
+
         self.per_node = bool(isolation and isolation.mode == PER_NODE)
         self.back_edges = graph.back_edges()
         self.entry_ids = {n.id for n in graph.entrypoints()}

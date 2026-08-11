@@ -26,8 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ContextManager, Protocol
 
+from engine.graph import safe_name
 from engine.workspace import (
     Workspace,
+    WorkspaceError,
     create_node_workspace,
     point_branch_at,
     tip_commits,
@@ -104,6 +106,9 @@ class PerNodeIsolation:
     mode: str = PER_NODE
     # node_id -> 該節點目前的 worktree
     workspaces: dict[str, Workspace] = field(default_factory=dict)
+    # 內部名稱 → 節點 id。兩個節點對應到同一個名稱就代表會共用工作目錄，
+    # 後建的會刪掉前一個（可能還在執行中），所以在真的動手前先擋下來。
+    _claimed: dict[str, str] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     # 收尾用的整合 worktree 名稱（合併多個終端分支時才會建）
@@ -112,6 +117,13 @@ class PerNodeIsolation:
     def acquire(self, node_id: str, base_commits: list[str]) -> Workspace:
         # git worktree add / remove 會動到共用的 .git，不能真的並行呼叫
         with self._lock:
+            safe = safe_name(node_id)
+            owner = self._claimed.setdefault(safe, node_id)
+            if owner != node_id:
+                raise WorkspaceError(
+                    f"節點 {node_id!r} 與 {owner!r} 會對應到同一個工作目錄 "
+                    f"{safe} —— 拒絕覆蓋還在使用中的目錄"
+                )
             workspace = create_node_workspace(
                 repo=self.repo,
                 worktree_root=self.worktree_root,

@@ -41,6 +41,7 @@ MAX_NODE_ID_LEN = 200
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _DOT_RUN = re.compile(r"\.{2,}")
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
 def safe_name(node_id: str) -> str:
@@ -108,6 +109,13 @@ class Node:
             raise GraphError("節點缺少 id")
         if _CONTROL_CHARS.search(self.id):
             raise GraphError(f"節點 id 不能含控制字元: {self.id!r}")
+        if _SURROGATES.search(self.id):
+            # JSON 可以帶單獨的 surrogate（"\ud800"），Python 收得下，但之後
+            # safe_name 做 .encode("utf-8") 會丟 UnicodeEncodeError —— 那會讓
+            # validate() 從「回傳問題清單」變成拋例外，API 直接 500。
+            raise GraphError(
+                f"節點 id 含無效的 Unicode surrogate: {self.id!r}"
+            )
         if len(self.id) > MAX_NODE_ID_LEN:
             raise GraphError(
                 f"節點 id 太長（上限 {MAX_NODE_ID_LEN} 字元）: {self.id[:40]}…"

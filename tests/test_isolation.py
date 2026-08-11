@@ -832,3 +832,68 @@ def test_graph_validation_rejects_internal_name_collision():
         assert any("同一個內部名稱" in p for p in problems), problems
     finally:
         gmod.safe_name = real
+
+
+# --------------------------------------- codex 第四輪 review 找到的問題
+
+
+def test_runner_rejects_internal_name_collision_at_runtime():
+    """唯一性不能只在 validate() 檢查 —— 直接建 Runner 就繞過了。"""
+    import engine.graph as gmod
+    from engine.context import RunContext
+
+    real = gmod.safe_name
+    try:
+        gmod.safe_name = lambda node_id: "same"
+        graph = parse({
+            "nodes": [
+                {"id": "a", "type": "mock", "config": {"prompt": "p"}},
+                {"id": "b", "type": "mock", "config": {"prompt": "p"}},
+            ],
+            "edges": [{"from": "a", "to": "b"}],
+        })
+        with pytest.raises(ValueError, match="同一個內部名稱"):
+            Runner(graph=graph, context=RunContext(run_id="x"),
+                   isolation=SharedIsolation(workspace=None),
+                   registry=Registry(), guards=Guards(), emit=Recorder())
+    finally:
+        gmod.safe_name = real
+
+
+def test_per_node_acquire_refuses_to_steal_another_nodes_directory(repo_and_base, tmp_path):
+    """兩個節點對應到同一個內部名稱時，第二次 acquire 必須拒絕。
+
+    否則它會強制移除第一個節點還在使用中的 worktree。
+    """
+    import engine.isolation as imod
+    from engine.workspace import WorkspaceError
+
+    repo, base = repo_and_base
+    iso = PerNodeIsolation(repo=repo, worktree_root=tmp_path / "wt",
+                          run_id="iso", run_base_sha=base.base_sha)
+    real = imod.safe_name
+    try:
+        imod.safe_name = lambda node_id: "collide"
+        first = iso.acquire("nodeA", [base.base_sha])
+        assert first.path.exists()
+        with pytest.raises(WorkspaceError, match="同一個工作目錄"):
+            iso.acquire("nodeB", [base.base_sha])
+        assert first.path.exists(), "第一個節點的工作目錄被搶走了"
+    finally:
+        imod.safe_name = real
+        iso.cleanup()
+
+
+def test_unpaired_surrogate_id_is_a_graph_error_not_a_crash():
+    """JSON 可以帶單獨的 surrogate。它必須變成 GraphError，不能讓 validate()
+    在 encode 時拋 UnicodeEncodeError —— 那會讓 API 回 500 而不是 400。"""
+    from engine.graph import GraphError
+
+    with pytest.raises(GraphError, match="surrogate"):
+        parse({"nodes": [{"id": "\ud800", "type": "mock",
+                          "config": {"prompt": "p"}}], "edges": []})
+
+    # 合法的 4-byte UTF-8（emoji）不該被誤擋
+    graph = parse({"nodes": [{"id": "🚀", "type": "mock",
+                              "config": {"prompt": "p"}}], "edges": []})
+    assert validate(graph, ["mock"]) == []
