@@ -10,7 +10,10 @@
       "id": "req",
       "type": "requirement",
       "label": "需求",
-      "pos": { "x": 40, "y": 220 }
+      "pos": {
+        "x": 40,
+        "y": 90
+      }
     },
     {
       "id": "plan",
@@ -21,7 +24,10 @@
         "sandbox": "read-only",
         "prompt": "讀懂以下需求，產出詳細的實作計畫。\n\n== 需求 ==\n{{ requirement }}\n\n計畫要包含：\n1. 任務拆解（每個子任務要改哪些檔案）\n2. 明確、可機械檢查的驗收標準（條列式，後續 QA 會照這份逐條比對）\n3. 需要特別注意的邊界情況\n\n只輸出計畫本身，不要動任何程式碼。"
       },
-      "pos": { "x": 250, "y": 220 }
+      "pos": {
+        "x": 290,
+        "y": 90
+      }
     },
     {
       "id": "impl",
@@ -32,7 +38,10 @@
         "permission_mode": "acceptEdits",
         "prompt": "依照以下計畫實作。這是第 {{ loop.iteration }} 輪。\n\n== 計畫 ==\n{{ nodes.plan.last_message }}\n\n{% if nodes.qa.structured %}== 上一輪 QA 發現的問題（必須逐項修掉）==\n{% for issue in nodes.qa.structured.issues %}- {{ issue }}\n{% endfor %}\n{{ nodes.qa.structured.summary }}\n{% endif %}{% if nodes.tests.exit_code and nodes.tests.exit_code != 0 %}== 測試失敗輸出 ==\n{{ nodes.tests.stdout }}\n{% endif %}\n完成後簡短說明你做了什麼、跟計畫有沒有出入、為什麼。"
       },
-      "pos": { "x": 470, "y": 220 }
+      "pos": {
+        "x": 540,
+        "y": 90
+      }
     },
     {
       "id": "commit",
@@ -42,7 +51,10 @@
         "action": "commit",
         "message": "impl: 第 {{ loop.iteration }} 輪實作 [{{ run.id }}]"
       },
-      "pos": { "x": 700, "y": 220 }
+      "pos": {
+        "x": 790,
+        "y": 90
+      }
     },
     {
       "id": "tests",
@@ -54,7 +66,10 @@
         "command": "if [ -f pytest.ini ] || [ -d tests ]; then python -m pytest -q; elif [ -f package.json ]; then npm test --silent; else echo '沒有偵測到測試設定，跳過'; fi",
         "expect_exit_code": 0
       },
-      "pos": { "x": 890, "y": 220 }
+      "pos": {
+        "x": 40,
+        "y": 330
+      }
     },
     {
       "id": "qa",
@@ -67,7 +82,10 @@
         "schema": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"PASS\",\"FAIL\"]},\"issues\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"summary\":{\"type\":\"string\"}},\"required\":[\"verdict\",\"issues\",\"summary\"],\"additionalProperties\":false}",
         "prompt": "對照計畫的驗收標準，審查以下實際的程式碼變更。\n\n== 原始計畫（含驗收標準）==\n{{ nodes.plan.last_message }}\n\n== 實際變更的檔案 ==\n{% for f in run.changed_files %}- {{ f }}\n{% endfor %}\n\n== 實際 diff ==\n{{ run.diff }}\n\n== 測試結果 ==\nexit code {{ nodes.tests.exit_code }}\n{{ nodes.tests.stdout }}\n\n請檢查：\n1. 是否逐條符合驗收標準\n2. 有沒有明顯 bug、未處理的邊界情況\n3. 是否偏離計畫，偏離是否合理\n\n你看的是 diff，不是實作者的自述 —— 不要採信任何「我已經處理好了」的說法，只認 diff 裡實際存在的程式碼。\n\n以 JSON 回覆，verdict 只能是 PASS 或 FAIL，issues 列出每一個必須修的問題。"
       },
-      "pos": { "x": 1100, "y": 220 }
+      "pos": {
+        "x": 290,
+        "y": 330
+      }
     },
     {
       "id": "gate",
@@ -76,7 +94,10 @@
       "config": {
         "expr": "nodes.qa.structured.verdict == 'PASS' and nodes.tests.exit_code == 0"
       },
-      "pos": { "x": 1330, "y": 220 }
+      "pos": {
+        "x": 540,
+        "y": 330
+      }
     },
     {
       "id": "summary",
@@ -87,17 +108,46 @@
         "command": "echo '--- 本次 run 的 commits ---'; git log --oneline {{ run.base_sha }}..HEAD; echo; echo '--- 變更檔案 ---'; git diff --stat {{ run.base_sha }}",
         "expect_exit_code": 0
       },
-      "pos": { "x": 1560, "y": 130 }
+      "pos": {
+        "x": 790,
+        "y": 330
+      }
     }
   ],
   "edges": [
-    { "from": "req", "to": "plan" },
-    { "from": "plan", "to": "impl" },
-    { "from": "impl", "to": "commit" },
-    { "from": "commit", "to": "tests" },
-    { "from": "tests", "to": "qa" },
-    { "from": "qa", "to": "gate" },
-    { "from": "gate", "to": "summary", "port": "true" },
-    { "from": "gate", "to": "impl", "port": "false" }
+    {
+      "from": "req",
+      "to": "plan"
+    },
+    {
+      "from": "plan",
+      "to": "impl"
+    },
+    {
+      "from": "impl",
+      "to": "commit"
+    },
+    {
+      "from": "commit",
+      "to": "tests"
+    },
+    {
+      "from": "tests",
+      "to": "qa"
+    },
+    {
+      "from": "qa",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "to": "summary",
+      "port": "true"
+    },
+    {
+      "from": "gate",
+      "to": "impl",
+      "port": "false"
+    }
   ]
 }

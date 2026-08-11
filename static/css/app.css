@@ -1,0 +1,76 @@
+/* 節點面板 ------------------------------------------------------------ */
+.palette-item {
+  display: flex; align-items: center; gap: .5rem;
+  padding: .35rem .5rem; margin-bottom: .25rem;
+  border: 1px solid #334155; border-radius: .25rem;
+  font-size: .8125rem; cursor: grab; background: #1e293b;
+}
+.palette-item[draggable="true"]:hover { border-color: #64748b; background: #273449; }
+.palette-item .tag {
+  font-size: 10px; padding: 0 .25rem; border-radius: 2px;
+  background: #7c2d12; color: #fdba74;
+}
+
+/* 型別色點 —— 面板與節點共用同一組顏色，肉眼一眼對得上 */
+.dot { width: .5rem; height: .5rem; border-radius: 999px; flex: none; }
+.dot-requirement { background: #94a3b8; }
+.dot-condition   { background: #c084fc; }
+.dot-git         { background: #fb923c; }
+.dot-shell       { background: #4ade80; }
+.dot-codex       { background: #38bdf8; }
+.dot-claude      { background: #f472b6; }
+.dot-opencode    { background: #facc15; }
+.dot-mock        { background: #64748b; }
+
+/* 畫布上的節點 --------------------------------------------------------- */
+#canvas { background:
+  radial-gradient(circle, #334155 1px, transparent 1px) 0 0 / 22px 22px, #0f172a; }
+
+.drawflow .drawflow-node.nd {
+  background: #1e293b; border: 1px solid #475569; border-radius: .375rem;
+  padding: 0; width: 210px; color: #e2e8f0; box-shadow: 0 1px 3px #0006;
+}
+.drawflow .drawflow-node.nd.selected { border-color: #38bdf8; box-shadow: 0 0 0 2px #38bdf844; }
+.drawflow .drawflow-node.nd .drawflow_content_node { padding: .5rem .625rem; }
+
+.nd-head { display: flex; align-items: center; gap: .375rem; }
+.nd-title { font-size: .8125rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nd-type { font-size: 10px; color: #64748b; margin: .125rem 0 .25rem; }
+.nd-sum {
+  font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 條件節點的 true / false 出口標籤 */
+.ports { display: flex; justify-content: flex-end; gap: .25rem; margin-top: .375rem; }
+.port { font-size: 9px; padding: 0 .25rem; border-radius: 2px; }
+.port-true  { background: #064e3b; color: #6ee7b7; }
+.port-false { background: #4c0519; color: #fda4af; }
+
+/* Drawflow 的接點與連線在深色底上的可見度 */
+.drawflow .connection .main-path { stroke: #64748b; stroke-width: 2px; }
+.drawflow .connection .main-path:hover { stroke: #38bdf8; }
+.drawflow .connection .main-path.selected { stroke: #38bdf8; }
+.drawflow .drawflow-node .input,
+.drawflow .drawflow-node .output {
+  background: #0f172a; border: 2px solid #64748b; width: .6875rem; height: .6875rem;
+}
+.drawflow .drawflow-node .output:hover,
+.drawflow .drawflow-node .input:hover { border-color: #38bdf8; }
+
+/* 表單 ---------------------------------------------------------------- */
+.fl { display: block; font-size: 11px; color: #94a3b8; margin-bottom: .125rem; }
+.fi {
+  width: 100%; background: #0f172a; border: 1px solid #334155;
+  border-radius: .25rem; padding: .25rem .375rem; font-size: .75rem; color: #e2e8f0;
+}
+.fi:focus { outline: none; border-color: #38bdf8; }
+.fh { display: block; font-size: 10px; color: #64748b; margin-top: .125rem; line-height: 1.4; }
+
+/* 執行視圖的節點狀態（P5） -------------------------------------------- */
+.drawflow .drawflow-node.st-running { border-color: #38bdf8; animation: pulse 1.4s ease-in-out infinite; }
+.drawflow .drawflow-node.st-passed  { border-color: #34d399; }
+.drawflow .drawflow-node.st-failed  { border-color: #fb7185; }
+.drawflow .drawflow-node.st-skipped { opacity: .45; }
+.drawflow .drawflow-node.st-cancelled { border-color: #94a3b8; opacity: .6; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 4px #38bdf833; } }

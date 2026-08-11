@@ -1,1 +1,53 @@
 {% extends "base.html" %}
+{% block title %}工作流編輯器{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/drawflow.min.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="flex h-[calc(100vh-53px)]">
+
+  <aside class="w-52 flex-none overflow-y-auto border-r border-slate-700 p-3">
+    <div class="mb-2 text-xs text-slate-500">拖到畫布上新增節點</div>
+    <div id="palette"></div>
+  </aside>
+
+  <section class="flex min-w-0 flex-1 flex-col">
+    <div class="flex flex-wrap items-center gap-2 border-b border-slate-700 px-3 py-2 text-sm">
+      <select id="wf-list" class="fi w-44"></select>
+      <input id="wf-name" class="fi w-44" placeholder="工作流名稱">
+      <button id="btn-save" class="rounded bg-slate-700 px-2.5 py-1 text-xs hover:bg-slate-600">儲存</button>
+      <button id="btn-validate" class="rounded bg-slate-700 px-2.5 py-1 text-xs hover:bg-slate-600">驗證</button>
+      <span id="status" class="text-xs text-slate-400"></span>
+      <span class="ml-auto flex gap-1">
+        <button id="btn-zoom-out" class="rounded bg-slate-700 px-2 py-1 text-xs hover:bg-slate-600">−</button>
+        <button id="btn-zoom-reset" class="rounded bg-slate-700 px-2 py-1 text-xs hover:bg-slate-600">⌂</button>
+        <button id="btn-zoom-in" class="rounded bg-slate-700 px-2 py-1 text-xs hover:bg-slate-600">+</button>
+      </span>
+    </div>
+
+    <div id="canvas" class="min-h-0 flex-1"></div>
+
+    <div class="flex-none border-t border-slate-700 p-3">
+      <div id="problems" class="mb-2 max-h-24 overflow-y-auto text-xs"></div>
+      <div class="flex gap-2">
+        <textarea id="requirement" rows="2" class="fi flex-1"
+                  placeholder="這次要做什麼？（會以 {{ '{{ requirement }}' }} 傳進節點的 prompt）"></textarea>
+        <button id="btn-run" class="flex-none rounded bg-sky-700 px-4 text-sm font-medium hover:bg-sky-600">執行</button>
+      </div>
+    </div>
+  </section>
+
+  <aside id="inspector" class="w-72 flex-none overflow-y-auto border-l border-slate-700">
+    <p class="p-3 text-sm text-slate-500">選一個節點來編輯設定。</p>
+  </aside>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/drawflow.min.js') }}"></script>
+<script type="module" src="{{ url_for('static', filename='js/editor.js') }}"></script>
+{% endblock %}
