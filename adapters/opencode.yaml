@@ -1,0 +1,40 @@
+id: opencode
+label: opencode
+description: opencode CLI。可自由選 provider/model，--agent 可指定自訂 agent。
+binary: opencode
+kind: agent
+mutates: true
+supports_schema: false
+
+prompt_delivery: argv
+
+argv:
+  - run
+  - "{{ prompt }}"
+  - --format
+  - json
+  - { flag: ["--dir", "{{ workdir }}"] }
+  - { flag: ["-m", "{{ model }}"] }
+  - { flag: ["--agent", "{{ agent }}"] }
+  - { flag: ["--variant", "{{ variant }}"] }
+  - { flag: ["-s", "{{ session_id }}"] }
+
+events: jsonl
+normalizer: opencode
+
+fields:
+  - name: model
+    type: text
+    label: 模型
+    default: ""
+    help: 格式 provider/model，例如 anthropic/claude-sonnet-4-5。留空用預設。
+  - name: agent
+    type: text
+    label: Agent
+    default: ""
+    help: opencode 自訂 agent 名稱（`opencode agent` 可列出）。留空用預設。
+  - name: variant
+    type: text
+    label: 推理強度
+    default: ""
+    help: provider 專屬，例如 high / max / minimal。

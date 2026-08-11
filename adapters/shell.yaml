@@ -1,0 +1,31 @@
+id: shell
+label: Shell 指令
+description: |
+  跑測試、lint、build。用真實的測試結果當驗收條件，比讓 LLM 讀 diff 猜有沒有壞
+  可靠得多 —— 建議在 QA 節點前面先擺一個這個。
+binary: bash
+kind: shell
+mutates: true
+supports_schema: false
+
+prompt_delivery: argv
+cwd: "{{ workdir }}"
+
+argv:
+  - -lc
+  - "{{ command }}"
+
+events: text
+normalizer: null
+
+fields:
+  - name: command
+    type: textarea
+    label: 指令
+    default: ""
+    help: 在 worktree 內執行。exit code 會進 context，可供 Condition 節點判斷。
+  - name: expect_exit_code
+    type: number
+    label: 預期 exit code
+    default: 0
+    help: 實際 exit code 不等於這個值時，節點標記為 failed。

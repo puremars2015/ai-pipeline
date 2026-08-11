@@ -1,0 +1,41 @@
+id: codex
+label: Codex
+description: OpenAI Codex CLI。規劃與 code review 表現好，支援 --output-schema 做結構化輸出。
+binary: codex
+kind: agent
+mutates: true
+supports_schema: true
+
+# prompt 從 stdin 進去。codex exec 的 help：
+#   "If not provided as an argument (or if `-` is used), instructions are read from stdin"
+prompt_delivery: stdin
+
+argv:
+  - exec
+  - --json
+  - --color
+  - never
+  - { flag: ["-C", "{{ workdir }}"] }
+  - { flag: ["-m", "{{ model }}"] }
+  - { flag: ["-s", "{{ sandbox }}"] }
+  - { flag: ["--output-schema", "{{ schema_file }}"] }
+  - { flag: ["-o", "{{ last_message_file }}"] }
+
+resume:
+  argv: [exec, resume, "{{ session_id }}", --json]
+
+events: jsonl
+normalizer: codex
+
+fields:
+  - name: sandbox
+    type: select
+    label: 沙箱模式
+    default: workspace-write
+    options: [read-only, workspace-write, danger-full-access]
+    help: 只做審查/規劃的節點請用 read-only，這樣它也才能真正平行執行。
+  - name: model
+    type: text
+    label: 模型
+    default: ""
+    help: 留空用 Codex 預設。

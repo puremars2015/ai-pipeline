@@ -1,0 +1,39 @@
+id: claude
+label: Claude Code
+description: Claude Code CLI。實作與多檔案改動很強，--json-schema 可做結構化輸出。
+binary: claude
+kind: agent
+mutates: true
+supports_schema: true
+
+prompt_delivery: argv
+
+# claude 沒有 --cd 這類 flag，工作目錄靠 cwd 決定（--add-dir 只是額外授權）。
+cwd: "{{ workdir }}"
+
+argv:
+  - -p
+  - "{{ prompt }}"
+  - --output-format
+  - stream-json
+  - --verbose
+  - { flag: ["--permission-mode", "{{ permission_mode }}"] }
+  - { flag: ["--model", "{{ model }}"] }
+  - { flag: ["--json-schema", "{{ schema_json }}"] }
+  - { flag: ["--session-id", "{{ session_id }}"] }
+
+events: jsonl
+normalizer: claude
+
+fields:
+  - name: permission_mode
+    type: select
+    label: 權限模式
+    default: acceptEdits
+    options: [acceptEdits, bypassPermissions, plan, default, dontAsk]
+    help: 無人看顧的流程用 acceptEdits。plan 模式只規劃不動手（可設 mutates=false）。
+  - name: model
+    type: text
+    label: 模型
+    default: ""
+    help: 留空用預設。可填 sonnet / opus 或完整模型 ID。

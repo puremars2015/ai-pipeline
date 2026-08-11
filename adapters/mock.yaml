@@ -1,0 +1,28 @@
+id: mock
+label: Mock Agent（測試用）
+description: |
+  假 agent，不呼叫 LLM、不花錢、行為確定。引擎的 DAG / 分支 / 迴圈 / 互斥鎖 /
+  timeout / 取消都靠它測。行為用 script 欄位的 JSON 描述，
+  詳見 tests/mock_agent.py 的 docstring。
+binary: python3
+kind: mock
+mutates: true
+supports_schema: true
+
+prompt_delivery: argv
+cwd: "{{ workdir }}"
+
+argv:
+  - "{{ tool_root }}/tests/mock_agent.py"
+  - "{{ script }}"
+  - { flag: ["{{ last_message_file }}"] }
+
+events: jsonl
+normalizer: mock
+
+fields:
+  - name: script
+    type: textarea
+    label: 行為描述 (JSON)
+    default: '{"message": "mock done"}'
+    help: 'JSON，可用 message / files / structured / tools / sleep / exit_code / fail'
