@@ -25,7 +25,7 @@ from engine.isolation import PER_NODE, PerNodeIsolation, SharedIsolation, parse_
 from engine.runner import FAILED, PASSED, Runner
 from engine.workspace import MergeConflict, create_workspace, prepare_run_base
 from settings import Guards
-from tests.test_runner import Recorder, mock_node, script
+from tests.test_runner import Recorder, build, mock_node, script
 from tests.test_workspace import make_repo
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -526,7 +526,7 @@ def test_safe_name_neutralises_dangerous_node_ids():
         assert "/" not in name and "\\" not in name
         assert ".." not in name
         assert not name.startswith((".", "-"))
-        assert len(name) <= 41  # 32 字前綴 + '-' + 8 字雜湊
+        assert len(name) <= 49  # 32 字前綴 + '-' + 16 字雜湊
         assert re.fullmatch(r"[A-Za-z0-9._-]+", name), name
 
 
@@ -739,3 +739,96 @@ def test_condition_does_not_read_a_parallel_nodes_diff(repo_and_base, tmp_path):
     assert result.status == PASSED, result.reason
     assert result.node_status["yes"] == PASSED, "條件節點看不到自己上游的 diff"
     assert result.node_status["no"] == R.SKIPPED
+
+
+# --------------------------------------- codex 第三輪 review 找到的問題
+
+
+def test_artifact_filenames_cannot_escape_the_artifacts_dir(tmp_path):
+    """schema / result 檔名原本直接用 node.id，那裡有 write_text 與 unlink。
+
+    支援 schema 的節點若 id 是 "../../victim"，會蓋掉或刪掉 artifacts 之外的檔案。
+    """
+    from engine.graph import safe_name
+
+    artifacts = tmp_path / "runs" / "r1" / "artifacts"
+    artifacts.mkdir(parents=True)
+    victim = tmp_path / "runs" / "victim.result.json"
+    victim.write_text("precious\n")
+
+    payload = {
+        "nodes": [{
+            "id": "../victim",
+            "type": "mock",
+            "config": {
+                "prompt": "p",
+                "script": '{"structured":{"ok":true}}',
+                "schema": '{"type":"object"}',
+            },
+        }],
+        "edges": [],
+    }
+    run, ctx, _ = build(payload, Registry(), tmp_path)
+    run.artifacts = artifacts
+    result = run.run()
+
+    assert result.status == PASSED, result.reason
+    assert victim.read_text() == "precious\n", "artifacts 目錄外的檔案被動到了"
+    written = {p.name for p in artifacts.glob("*")}
+    assert any(safe_name("../victim") in n for n in written), written
+
+
+def test_safe_name_always_yields_a_valid_git_ref(tmp_path):
+    """每一個 Node 允許的 id 都必須產生合法的 git branch 名稱。
+
+    per_node 會用它當 branch，check-ref-format 不過的話 run 會直接中止。
+    """
+    from engine.graph import safe_name
+    from engine.workspace import node_branch
+
+    repo = make_repo(tmp_path / "refcheck")
+    nasty = [
+        "a..b", "..", "...", "a.", ".a", "-a", "a-", "HEAD", "head",
+        "a.lock", "refs/heads/x", "a@{b}", "a b", "節點", "a\\b", "a~b",
+        "a^b", "a:b", "a?b", "a*b", "a[b]", "x" * 200, "。。。", "-",
+    ]
+    for node_id in nasty:
+        branch = node_branch("run1", node_id)
+        code = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch],
+            cwd=repo, capture_output=True,
+        ).returncode
+        assert code == 0, f"id {node_id!r} → 不合法的 branch {branch!r}"
+        assert ".." not in safe_name(node_id)
+
+
+def test_safe_name_digest_is_long_enough_to_resist_collisions():
+    """前綴會被截斷，唯一性完全靠雜湊 —— 8 個 hex（32 bit）用生日攻擊幾萬次
+    就能撞出來，實際上 codex 就找到了一組。"""
+    from engine.graph import safe_name
+
+    a = "x" * 32 + "20249"
+    b = "x" * 32 + "72765"
+    assert safe_name(a) != safe_name(b), "截斷後的長 id 撞在一起了"
+    # 雜湊長度至少 16 個 hex
+    assert len(safe_name("q").rsplit("-", 1)[1]) >= 16
+
+
+def test_graph_validation_rejects_internal_name_collision():
+    """就算雜湊真的撞了，圖驗證也要擋下來 —— 否則兩個節點共用一個工作目錄。"""
+    import engine.graph as gmod
+
+    real = gmod.safe_name
+    try:
+        gmod.safe_name = lambda node_id: "same-name"   # 強制碰撞
+        graph = parse({
+            "nodes": [
+                {"id": "a", "type": "mock", "config": {"prompt": "p"}},
+                {"id": "b", "type": "mock", "config": {"prompt": "p"}},
+            ],
+            "edges": [{"from": "a", "to": "b"}],
+        })
+        problems = validate(graph, ["mock"])
+        assert any("同一個內部名稱" in p for p in problems), problems
+    finally:
+        gmod.safe_name = real

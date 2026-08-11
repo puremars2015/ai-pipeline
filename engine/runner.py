@@ -504,10 +504,15 @@ class Runner:
             variables["schema_json"] = json.dumps(schema_obj, ensure_ascii=False)
             if self.artifacts:
                 self.artifacts.mkdir(parents=True, exist_ok=True)
-                schema_path = self.artifacts / f"{node.id}.schema.json"
+                # 檔名用 safe_name，不是原始 id —— 這裡有 write_text 與 unlink，
+                # 而 id 是工作流 JSON 給的任意字串。"../../victim" 會蓋掉或刪掉
+                # artifacts 目錄外的檔案。
+                schema_path = self._artifact(f"{g.safe_name(node.id)}.schema.json")
                 schema_path.write_text(variables["schema_json"], "utf-8")
                 variables["schema_file"] = str(schema_path)
-                last_message_file = self.artifacts / f"{node.id}.result.json"
+                last_message_file = self._artifact(
+                    f"{g.safe_name(node.id)}.result.json"
+                )
                 variables["last_message_file"] = str(last_message_file)
                 last_message_file.unlink(missing_ok=True)
 
@@ -583,6 +588,18 @@ class Runner:
                        phase="node_commit", sha=sha),
                 )
         self._refresh_diff(workspace)
+
+    def _artifact(self, filename: str) -> Path:
+        """組出 artifacts 目錄下的檔案路徑，並確認它真的在裡面。
+
+        第二道防線：這個路徑會被寫入與刪除，不能只靠 safe_name 正確。
+        """
+        assert self.artifacts is not None
+        base = self.artifacts.resolve()
+        path = (base / filename).resolve()
+        if base not in path.parents:
+            raise RunAborted(f"產物檔名逃出 {base}: {filename!r}")
+        return path
 
     def _spawn(self, node, spec, normalizer, variables, prompt, timeout,
                last_message_file) -> NodeResult:

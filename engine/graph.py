@@ -40,6 +40,7 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 MAX_NODE_ID_LEN = 200
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+_DOT_RUN = re.compile(r"\.{2,}")
 
 
 def safe_name(node_id: str) -> str:
@@ -57,9 +58,19 @@ def safe_name(node_id: str) -> str:
 
     所以外部 id 保持自由，內部名稱一律是「可讀前綴 + id 的雜湊」。雜湊取自
     未經轉換的原始 id，所以大小寫或 Unicode 正規化不同的 id 不會撞在一起。
+
+    細節都是必要的：
+
+    - 前綴會被截斷（32 字元），所以兩個長 id 可能共用同一個前綴，唯一性完全
+      靠雜湊 —— 8 個十六進位字元只有 32 bit，用生日攻擊幾萬次就能撞出來，
+      所以取 16 個字元（64 bit）。graph 驗證另外還會檢查整張圖沒有碰撞。
+    - 前綴裡的連續句點要收掉：`git check-ref-format` 會拒絕含 `..` 的 ref
+      （`a..b` 這種 id 會讓 per_node 的 run 在建 worktree 時直接中止）。
+    - 結尾永遠是 `-<hex>`，所以不可能等於 `HEAD`，也不可能以 `.lock` 結尾。
     """
-    digest = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:8]
-    prefix = _UNSAFE.sub("-", node_id).strip("-.")[:32]
+    digest = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:16]
+    prefix = _UNSAFE.sub("-", node_id)[:32]
+    prefix = _DOT_RUN.sub(".", prefix).strip("-.")
     return f"{prefix}-{digest}" if prefix else f"node-{digest}"
 
 # 內建節點型別（其餘的 type 必須對應一個 adapter id）
@@ -358,6 +369,19 @@ def validate(graph: Graph, known_adapters: Iterable[str]) -> list[str]:
 
         if node.max_visits is not None and node.max_visits < 1:
             problems.append(f"節點 {node.label}：max_visits 必須 >= 1")
+
+    # 內部名稱（worktree 目錄 / branch）必須全圖唯一。safe_name 的前綴會截斷、
+    # 雜湊也只取一段，理論上仍可能碰撞；撞了就是兩個節點共用同一個工作目錄，
+    # 後建的會強制移除還在執行中的那個。這裡直接擋下來。
+    by_safe: dict[str, list[str]] = {}
+    for node_id in graph.nodes:
+        by_safe.setdefault(safe_name(node_id), []).append(node_id)
+    for safe, ids in by_safe.items():
+        if len(ids) > 1:
+            problems.append(
+                f"這些節點 id 會對應到同一個內部名稱 {safe}: {sorted(ids)}。"
+                "請把其中一個改名。"
+            )
 
     problems.extend(_validate_settings(graph))
     return problems
