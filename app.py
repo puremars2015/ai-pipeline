@@ -180,6 +180,59 @@ def create_app(config_path: Path | None = None) -> Flask:
         found["active"] = service.is_active(run_id)
         return jsonify(found)
 
+    @app.get("/api/runs/<run_id>/diff")
+    def run_diff(run_id: str):
+        """這個 run 產生的變更。
+
+        從 branch 算而不是從 worktree 算 —— worktree 可能已經清掉了，但 branch
+        一定還在（要留給人工檢查與合併）。
+        """
+        found = store.get_run(run_id)
+        if not found:
+            return jsonify({"error": "找不到 run"}), 404
+        if not found["branch"] or not found["base_sha"]:
+            return jsonify({"diff": "", "files": [], "note": "這個 run 沒有建立 branch"})
+
+        import subprocess
+
+        def git(*args: str) -> str:
+            proc = subprocess.run(
+                ["git", *args], cwd=str(cfg.project_repo),
+                capture_output=True, text=True,
+            )
+            return proc.stdout if proc.returncode == 0 else ""
+
+        rng = f"{found['base_sha']}..{found['branch']}"
+        return jsonify(
+            {
+                "diff": git("diff", rng)[:400_000],  # 別把整個瀏覽器塞爆
+                "files": [f for f in git("diff", "--name-only", rng).splitlines() if f],
+                "stat": git("diff", "--stat", rng),
+                "log": git("log", "--oneline", rng),
+                "branch": found["branch"],
+                "merge_command": f"git merge --no-ff {found['branch']}",
+            }
+        )
+
+    @app.get("/api/runs/<run_id>/artifacts")
+    def run_artifacts(run_id: str):
+        """節點產物（QA 的結構化輸出、schema 等），存在 repo 之外。"""
+        base = cfg.runs_dir / run_id / "artifacts"
+        if not base.exists():
+            return jsonify({"artifacts": []})
+        items = []
+        for path in sorted(base.glob("*")):
+            if not path.is_file():
+                continue
+            items.append(
+                {
+                    "name": path.name,
+                    "size": path.stat().st_size,
+                    "content": path.read_text("utf-8", errors="replace")[:20_000],
+                }
+            )
+        return jsonify({"artifacts": items})
+
     @app.post("/api/runs/<run_id>/cancel")
     def cancel_run(run_id: str):
         if not store.get_run(run_id):

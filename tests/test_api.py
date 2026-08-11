@@ -422,6 +422,38 @@ def test_sse_two_subscribers_both_get_events(app_ctx):
         assert events[-1]["data"].get("phase") == "run_end"
 
 
+def test_run_end_event_carries_final_status(app_ctx):
+    """run_end 事件本身要帶最終狀態。
+
+    前端的狀態標頭直接讀這則事件，不再另發一個 request —— 原本靠 run_end 觸發
+    fetch 才更新，那個 fetch 一慢，標頭就永遠卡在 running 且不會自己恢復。
+    """
+    client, _, _ = app_ctx
+    run_id = client.post(
+        "/api/runs", json={"graph": mock_graph(message="x"), "requirement": "r"}
+    ).get_json()["run_id"]
+    events, _ = read_sse(client, run_id)
+
+    end = events[-1]
+    assert end["data"]["phase"] == "run_end"
+    assert end["data"]["status"] == "passed"
+    assert end["data"]["branch"] == f"task/{run_id}"
+
+
+def test_failed_run_end_event_carries_reason(app_ctx):
+    client, _, _ = app_ctx
+    run_id = client.post(
+        "/api/runs",
+        json={"graph": mock_graph(message="x", exit_code=7), "requirement": "r"},
+    ).get_json()["run_id"]
+    events, _ = read_sse(client, run_id)
+
+    end = events[-1]
+    assert end["data"]["phase"] == "run_end"
+    assert end["data"]["status"] == "failed"
+    assert "exit code 7" in end["data"]["reason"]
+
+
 def test_sse_unknown_run(app_ctx):
     client, _, _ = app_ctx
     assert client.get("/api/runs/nope/events").status_code == 404

@@ -99,11 +99,15 @@ class RunBus:
 
     # ------------------------------------------------------------ 串流
 
-    def stream(self, after_seq: int = 0, keepalive: float = 15.0):
+    def stream(self, after_seq: int = 0, keepalive: float = 5.0):
         """產出事件 dict，直到 run 結束。
 
         先訂閱再回放，避免兩者之間漏事件；回放過的序號會從即時佇列裡跳過。
-        每隔 keepalive 秒吐一個 None，讓呼叫端送 SSE 註解行維持連線。
+
+        每隔 keepalive 秒吐一個 None，呼叫端會送出一行 SSE 註解。這不只是維持
+        連線 —— 使用者切走頁面後瀏覽器會關掉 EventSource，但伺服器要等到下一次
+        真的寫入失敗才會發現。keepalive 設短一點，被放生的連線才不會長時間佔住
+        Werkzeug 的執行緒（開發伺服器是一個連線一個執行緒）。
         """
         sub = self.subscribe()
         try:

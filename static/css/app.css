@@ -74,3 +74,49 @@
 .drawflow .drawflow-node.st-skipped { opacity: .45; }
 .drawflow .drawflow-node.st-cancelled { border-color: #94a3b8; opacity: .6; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 4px #38bdf833; } }
+
+/* 執行視圖 ------------------------------------------------------------ */
+.tab { padding: .25rem .5rem; border-radius: .25rem; color: #94a3b8; }
+.tab:hover { background: #1e293b; }
+.tab-on { background: #334155; color: #e2e8f0; }
+
+.nd-badge { margin-left: auto; font-size: 11px; }
+
+/* 時間軸 */
+.tl {
+  display: grid; grid-template-columns: 1.1rem 5.5rem 1fr; gap: .375rem;
+  align-items: start; padding: .1875rem .25rem; font-size: 11px;
+  border-bottom: 1px solid #1e293b;
+}
+.tl-icon { color: #64748b; text-align: center; }
+.tl-node { color: #64748b; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; }
+.tl-body { color: #cbd5e1; min-width: 0; overflow-wrap: anywhere; }
+.tl-body pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #94a3b8; margin-top: .25rem; }
+.tl-body summary { cursor: pointer; }
+
+.tl-message  .tl-body { color: #e2e8f0; }
+.tl-error    .tl-body { color: #fda4af; }
+.tl-tool_call  .tl-body { color: #7dd3fc; }
+.tl-tool_result .tl-body { color: #64748b; }
+.tl-file_edit .tl-body { color: #6ee7b7; font-family: ui-monospace, monospace; }
+.tl-usage    .tl-body { color: #64748b; }
+.tl-reasoning .tl-body { color: #a78bfa; font-style: italic; }
+
+/* agent 的原始 stdout 量很大，預設收起來，免得把重要訊息淹掉 */
+.tl-noise { display: none; }
+.show-noise .tl-noise { display: grid; }
+
+/* 節點 / 變更 / 產物面板 */
+.sec { margin-top: .75rem; }
+.sec-t { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #64748b; margin-bottom: .25rem; }
+.blk {
+  background: #020617; border: 1px solid #1e293b; border-radius: .25rem;
+  padding: .375rem .5rem; font-size: 11px; white-space: pre-wrap;
+  overflow-wrap: anywhere; max-height: 22rem; overflow: auto; color: #cbd5e1;
+}
+.blk.diff { white-space: pre; overflow-x: auto; max-height: 30rem; }
+.d-add  { color: #6ee7b7; }
+.d-del  { color: #fda4af; }
+.d-hunk { color: #7dd3fc; }
+.d-file { color: #e2e8f0; font-weight: 600; }
+.d-meta { color: #64748b; }
