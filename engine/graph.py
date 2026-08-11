@@ -29,14 +29,38 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-# 節點 id 會被用來組 worktree 路徑與 git branch 名稱，所以格式必須收緊。
-# 工作流是從 POST /api/runs 進來的任意 JSON —— 若放行 "../../something"，
-# create_node_workspace 會在 worktree_root 之外建目錄，然後 rmtree 掉它。
-NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# 節點 id 是使用者可見的穩定識別字，不直接拿去當檔名或 ref 名稱 ——
+# 那是 safe_name() 的事。這裡只擋真的不能接受的東西：空的、含控制字元、過長。
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+MAX_NODE_ID_LEN = 200
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def safe_name(node_id: str) -> str:
+    """把節點 id 轉成可以安全當目錄名與 git ref 用的名稱。
+
+    為什麼要轉，而不是直接限制 id 的格式：
+
+    - id 會被組成 worktree 路徑，而那個路徑底下有 rmtree。"../../victim"
+      這種 id 會刪到 worktree_root 之外的東西。
+    - macOS 的檔案系統預設不分大小寫。節點 "A" 與 "a" 是兩個合法且不同的節點，
+      但會對應到同一個目錄 —— 建第二個的時候會強制移除第一個（那時它還在跑），
+      隔離直接失效。
+    - 直接限制 id 只能用 ASCII 會讓既有的工作流無法載入（先前只要求非空，
+      "規劃" 這種中文 id 在共用模式下完全正常）。
+
+    所以外部 id 保持自由，內部名稱一律是「可讀前綴 + id 的雜湊」。雜湊取自
+    未經轉換的原始 id，所以大小寫或 Unicode 正規化不同的 id 不會撞在一起。
+    """
+    digest = hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:8]
+    prefix = _UNSAFE.sub("-", node_id).strip("-.")[:32]
+    return f"{prefix}-{digest}" if prefix else f"node-{digest}"
 
 # 內建節點型別（其餘的 type 必須對應一個 adapter id）
 REQUIREMENT = "requirement"
@@ -71,12 +95,11 @@ class Node:
     def __post_init__(self) -> None:
         if not self.id:
             raise GraphError("節點缺少 id")
-        if not NODE_ID_RE.match(self.id):
+        if _CONTROL_CHARS.search(self.id):
+            raise GraphError(f"節點 id 不能含控制字元: {self.id!r}")
+        if len(self.id) > MAX_NODE_ID_LEN:
             raise GraphError(
-                f"節點 id 格式不合法: {self.id!r}。"
-                "只允許英數字開頭，之後可用英數字、點、底線、減號，最長 64 字元。"
-                "（id 會用來組工作目錄路徑與 git branch 名稱，所以不能含路徑分隔符、"
-                "'..' 或其他特殊字元。）"
+                f"節點 id 太長（上限 {MAX_NODE_ID_LEN} 字元）: {self.id[:40]}…"
             )
         if self.join not in ("all", "any"):
             raise GraphError(f"節點 {self.id}: join 只能是 all 或 any")

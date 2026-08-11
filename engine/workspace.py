@@ -262,10 +262,15 @@ def prepare_run_base(
 def node_branch(run_id: str, node_id: str) -> str:
     """節點層級的 branch 名稱。
 
-    刻意不放在 task/<run-id>/ 底下 —— git 的 ref 存成檔案，
-    refs/heads/task/<run-id> 一存在就不可能再有 refs/heads/task/<run-id>/<node-id>。
+    用 safe_name 而不是原始 id：id 可以是中文、可以含空白、可以只差大小寫，
+    都不能直接當 ref 名稱（詳見 engine/graph.py 的 safe_name）。
+
+    也刻意不放在 task/<run-id>/ 底下 —— git 的 ref 存成檔案，
+    refs/heads/task/<run-id> 一存在就不可能再有 refs/heads/task/<run-id>/<name>。
     """
-    return f"node/{run_id}/{node_id}"
+    from engine.graph import safe_name
+
+    return f"node/{run_id}/{safe_name(node_id)}"
 
 
 def create_node_workspace(
@@ -292,12 +297,14 @@ def create_node_workspace(
     # refs/heads/task/<run-id> 存在時就不可能再建 refs/heads/task/<run-id>/<node-id>
     # （會是 "cannot lock ref: … exists; cannot create …"）。所以節點的 branch
     # 換一個獨立的前綴，跟 run 層級的 task/<run-id> 不相干。
+    from engine.graph import safe_name
+
     branch = node_branch(run_id, node_id)
 
-    # 路徑必須確認落在 run 目錄之內才敢刪。graph 那層已經限制了 node_id 的格式，
-    # 這裡是第二道防線 —— 底下有 rmtree，不能只靠上游驗證過。
+    # 路徑必須確認落在 run 目錄之內才敢刪。safe_name 已經保證不含路徑分隔符，
+    # 這裡是第二道防線 —— 底下有 rmtree，不能只靠上游的轉換函式正確。
     run_dir = (worktree_root / run_id).resolve()
-    path = (run_dir / node_id).resolve()
+    path = (run_dir / safe_name(node_id)).resolve()
     if path == run_dir or run_dir not in path.parents:
         raise WorkspaceError(
             f"節點 id 會讓工作目錄逃出 {run_dir}: {node_id!r} → {path}"
@@ -352,21 +359,6 @@ def tip_commits(repo: Path, commits: list[str]) -> list[str]:
             other != commit and is_ancestor(repo, commit, other) for other in unique
         )
     ]
-
-
-def diff_between(repo: Path, base: str, head: str) -> tuple[str, list[str]]:
-    """兩個 commit 之間的 diff。不需要 worktree。
-
-    給沒有工作目錄的節點用（per_node 模式下的條件 / 需求節點）—— 它們仍然可能
-    在運算式裡引用 run.diff 或 run.changed_files。
-    """
-    if not base or not head or base == head:
-        return "", []
-    diff = _git(["diff", f"{base}..{head}"], cwd=repo, check=False).stdout
-    names = _git(
-        ["diff", "--name-only", f"{base}..{head}"], cwd=repo, check=False
-    ).stdout
-    return diff, [line for line in names.splitlines() if line]
 
 
 def point_branch_at(repo: Path, branch: str, commit: str) -> None:

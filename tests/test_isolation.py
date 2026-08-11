@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -201,8 +202,10 @@ def test_each_node_gets_its_own_branch(repo_and_base, tmp_path):
     repo, base = repo_and_base
     result, _, _, iso = run_per_node(payload, repo, base, tmp_path)
     assert result.status == PASSED, result.reason
-    assert iso.workspaces["only"].branch == "node/iso/only"
-    assert "node/iso/only" in git(["branch", "--list", "node/iso/only"], repo)
+    from engine.graph import safe_name
+    expected = f"node/iso/{safe_name('only')}"
+    assert iso.workspaces["only"].branch == expected
+    assert expected in git(["branch", "--list", expected], repo)
 
 
 # ------------------------------------------------ 上游成果傳到下游
@@ -471,7 +474,7 @@ def test_cleanup_removes_all_node_worktrees(repo_and_base, tmp_path):
     iso.cleanup()
     assert not any(p.exists() for p in paths)
     # branch 保留下來給人工檢視
-    assert "node/iso/x" in git(["branch", "--list", "node/iso/*"], repo)
+    assert git(["branch", "--list", "node/iso/*"], repo).strip(), "節點 branch 應保留"
 
 
 # ----------------------------------------------- shared 模式沒有回歸
@@ -509,46 +512,83 @@ def test_shared_mode_still_serialises(repo_and_workspace, tmp_path):
 # ------------------------------------------------ codex review 找到的問題
 
 
-def test_node_id_cannot_escape_the_worktree_root():
-    """節點 id 會被組成 worktree 路徑，而那個路徑底下有 rmtree。
+def test_safe_name_neutralises_dangerous_node_ids():
+    """節點 id 是使用者可見的穩定識別字，內部路徑/ref 名稱另外算。
 
-    工作流是從 POST /api/runs 進來的任意 JSON，若放行 "../../victim"，
-    create_node_workspace 會在 worktree_root 之外建目錄然後刪掉它。
+    直接限制 id 格式會擋掉本來合法的既有工作流（"規劃" 這種中文 id 在共用模式
+    下完全正常），所以改成永遠轉換成安全名稱。
     """
+    from engine.graph import safe_name
+
+    for dangerous in ["../../victim", "a/b", "/abs/path", "..", ".",
+                      "x" * 300, "a b", "節點", "~/.ssh/authorized_keys"]:
+        name = safe_name(dangerous)
+        assert "/" not in name and "\\" not in name
+        assert ".." not in name
+        assert not name.startswith((".", "-"))
+        assert len(name) <= 41  # 32 字前綴 + '-' + 8 字雜湊
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", name), name
+
+
+def test_safe_name_is_stable_and_collision_free():
+    """同一個 id 一定得到同一個名稱；不同 id 一定不同 —— 包含只差大小寫的。
+
+    macOS 預設的檔案系統不分大小寫：節點 "A" 與 "a" 是兩個合法且不同的節點，
+    若對應到同一個目錄，建第二個時會強制移除還在執行中的第一個。
+    """
+    from engine.graph import safe_name
+
+    assert safe_name("impl") == safe_name("impl")
+    names = {safe_name(x) for x in ["A", "a", "Impl", "impl", "規劃", "规划"]}
+    assert len(names) == 6, f"有 id 撞在一起了: {names}"
+    # 在不分大小寫的檔案系統上也不能撞
+    assert len({n.lower() for n in names}) == 6
+
+
+def test_existing_workflows_with_unicode_ids_still_load():
+    """相容性：14f4863 之前只要求 id 非空，既有工作流不能因升級就載不進來。"""
+    graph = parse({
+        "nodes": [
+            {"id": "需求", "type": "requirement"},
+            {"id": "code review", "type": "mock", "config": {"prompt": "p"}},
+        ],
+        "edges": [{"from": "需求", "to": "code review"}],
+    })
+    assert set(graph.nodes) == {"需求", "code review"}
+    assert validate(graph, ["mock"]) == []
+
+
+def test_node_id_still_rejects_the_genuinely_impossible():
     from engine.graph import GraphError, Node
 
-    for bad in ["../escape", "a/b", "/abs/path", "..", ".", "-lead", "x" * 65, "a b"]:
-        with pytest.raises(GraphError, match="id"):
-            Node(id=bad, type="mock")
-
-    for good in ["req", "impl2", "qa-round.2", "a_b", "A1"]:
-        assert Node(id=good, type="mock").id == good
-
-
-def test_graph_parse_rejects_traversal_node_id():
-    from engine.graph import GraphError
-
-    with pytest.raises(GraphError, match="id 格式不合法"):
-        parse({"nodes": [{"id": "../../victim", "type": "mock",
-                          "config": {"prompt": "p"}}], "edges": []})
+    with pytest.raises(GraphError, match="控制字元"):
+        Node(id="a\x00b", type="mock")
+    with pytest.raises(GraphError, match="太長"):
+        Node(id="x" * 201, type="mock")
+    with pytest.raises(GraphError, match="缺少 id"):
+        Node(id="", type="mock")
 
 
-def test_workspace_layer_also_refuses_to_escape(repo_and_base, tmp_path):
-    """第二道防線：底下有 rmtree，不能只靠 graph 那層驗證過。"""
-    from engine.workspace import WorkspaceError, create_node_workspace
+def test_traversal_node_id_stays_inside_the_run_dir(repo_and_base, tmp_path):
+    """就算 id 長得像路徑穿越，worktree 也必須落在 run 目錄內，且不刪到別人。"""
+    from engine.workspace import create_node_workspace
 
     repo, base = repo_and_base
     victim = tmp_path / "wt" / "DO_NOT_DELETE"
     victim.mkdir(parents=True)
     (victim / "precious.txt").write_text("keep me\n")
 
-    with pytest.raises(WorkspaceError, match="逃出"):
-        create_node_workspace(
-            repo=repo, worktree_root=tmp_path / "wt", run_id="iso",
-            node_id="../DO_NOT_DELETE", base_commits=[base.base_sha],
-            run_base_sha=base.base_sha,
-        )
-    assert (victim / "precious.txt").exists(), "目標目錄被刪掉了"
+    ws = create_node_workspace(
+        repo=repo, worktree_root=tmp_path / "wt", run_id="iso",
+        node_id="../DO_NOT_DELETE", base_commits=[base.base_sha],
+        run_base_sha=base.base_sha,
+    )
+    try:
+        run_dir = (tmp_path / "wt" / "iso").resolve()
+        assert run_dir in ws.path.parents, f"逃出 run 目錄: {ws.path}"
+        assert (victim / "precious.txt").exists(), "刪到了不該碰的目錄"
+    finally:
+        ws.remove()
 
 
 def test_condition_as_fan_in_keeps_both_branches(repo_and_base, tmp_path):

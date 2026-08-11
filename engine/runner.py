@@ -36,7 +36,7 @@ from engine.context import ContextError, RunContext, evaluate, render_template
 from engine.events import ERROR, MESSAGE, STATUS, ev
 from engine.executor import Cancelled, NodeResult, execute
 from engine.isolation import PER_NODE, Isolation, PerNodeIsolation
-from engine.workspace import MergeConflict, Workspace, diff_between
+from engine.workspace import MergeConflict, Workspace
 from settings import Guards
 
 # emit(node_id, event_dict)
@@ -49,8 +49,14 @@ FAILED = "failed"
 SKIPPED = "skipped"
 CANCELLED = "cancelled"
 
-# 這些節點型別純粹處理資料，不需要工作目錄；它們把上游的狀態原樣往下傳。
-PASSTHROUGH_TYPES = frozenset({g.REQUIREMENT, g.CONDITION})
+# 需求節點若沒有入邊，它的狀態就定義上等於 run 的起點、diff 定義上是空的，
+# 不需要工作目錄。其他所有節點（含條件節點）都要有 —— 條件節點可能引用
+# run.diff / changed_files，而且在 per_node 模式下它可能自己就是 fan-in 點，
+# 需要真的把多個上游合併起來才算得出正確的狀態。
+def _needs_workspace(graph: g.Graph, node: g.Node) -> bool:
+    if node.type == g.REQUIREMENT and not graph.incoming(node.id):
+        return False
+    return True
 
 
 class RunAborted(Exception):
@@ -100,13 +106,9 @@ class Runner:
         self.arrived: dict[str, set[g.Edge]] = {nid: set() for nid in graph.nodes}
         self.visits: dict[str, int] = {nid: 0 for nid in graph.nodes}
         self.status: dict[str, str] = {nid: PENDING for nid in graph.nodes}
-        # per_node 模式的狀態傳遞。
-        # node_state 是「這個節點的輸出狀態由哪些 commit 組成」—— 刻意是 list 而
-        # 不是單一 commit：條件 / 需求節點自己不產生 commit，若它剛好是 fan-in
-        # 點（兩條平行分支都連進來），只記第一個 commit 會把另一條分支的成果
-        # 整個弄丟。它改成把所有上游都往下帶，由下一個真的有工作目錄的節點合併。
-        self.node_state: dict[str, list[str]] = {}
-        # 只記真的產生了 commit 的節點，給 RunResult 對外報告用
+        # per_node 模式：每個節點跑完的產出 commit，是下游節點的起始狀態。
+        # 每個節點都有工作目錄（除了沒有入邊的需求節點），所以每個節點都有一個
+        # 明確的產出 commit —— 不需要「一組還沒合併的 commit」這種中間狀態。
         self.output_commit: dict[str, str] = {}
         self.steps = 0
         self._commit_lock = threading.Lock()
@@ -256,19 +258,22 @@ class Runner:
                     commits.append(value)
 
         with self._commit_lock:
-            add(self.node_state.get(node_id, []))
+            own = self.output_commit.get(node_id)
+            if own:
+                add([own])
             for edge in self.graph.incoming(node_id):
-                add(self.node_state.get(edge.src, []))
+                upstream = self.output_commit.get(edge.src)
+                if upstream:
+                    add([upstream])
 
         if not commits:
             commits.append(self.ctx.base_sha)
         return commits
 
     def _record_commit(self, node_id: str, commit: str) -> None:
-        """真的產生了 commit 的節點：它的輸出狀態就是那一個 commit。"""
+        """記下節點的產出狀態。"""
         with self._commit_lock:
             self.output_commit[node_id] = commit
-            self.node_state[node_id] = [commit]
 
     def passed_commits(self) -> list[str]:
         """所有成功節點的產出 commit，給收尾時算 tip 用。"""
@@ -284,7 +289,7 @@ class Runner:
         if self.isolation is None:
             return None
         node = self.graph.nodes[node_id]
-        if self.per_node and node.type in PASSTHROUGH_TYPES:
+        if not _needs_workspace(self.graph, node):
             return None
         return self.isolation.acquire(node_id, self._base_commits(node_id))
 
@@ -300,14 +305,8 @@ class Runner:
         """
         if workspace is not None:
             return workspace.diff(), workspace.changed_files()
-
-        if not self.per_node:
-            return "", []
-
-        bases = self._base_commits(node_id)
-        if len(bases) != 1 or bases[0] == self.ctx.base_sha:
-            return "", []
-        return diff_between(Path(self.ctx.repo), self.ctx.base_sha, bases[0])
+        # 只有「沒有入邊的需求節點」會走到這裡，它的 diff 定義上是空的
+        return "", []
 
     def _node_vars(
         self, node_id: str, workspace: Workspace | None
@@ -359,9 +358,9 @@ class Runner:
                 )
 
             if node.type == g.REQUIREMENT:
-                port = self._run_requirement(node, out)
+                port = self._run_requirement(node, out, workspace)
             elif node.type == g.CONDITION:
-                port = self._run_condition(node, out)
+                port = self._run_condition(node, out, workspace)
             elif node.type == g.GIT:
                 port = self._run_git(node, out, workspace)
             else:
@@ -387,24 +386,23 @@ class Runner:
         )
         return port
 
-    def _run_requirement(self, node: g.Node, out) -> str:
+    def _run_requirement(self, node: g.Node, out, workspace) -> str:
         text = node.config.get("text") or self.ctx.requirement
         self.ctx.requirement = text
         out.last_message = text
         out.status = PASSED
         self.status[node.id] = PASSED
-        # 純資料節點：把上游狀態原樣往下傳
-        self._pass_through(node.id)
+        self._carry_state(node.id, workspace)
         self.emit(node.id, ev(MESSAGE, text))
         return g.DEFAULT_PORT
 
-    def _run_condition(self, node: g.Node, out) -> str:
+    def _run_condition(self, node: g.Node, out, workspace) -> str:
         expr = node.config.get("expr") or ""
-        verdict = evaluate(expr, self._node_vars(node.id, None))
+        verdict = evaluate(expr, self._node_vars(node.id, workspace))
         out.status = PASSED
         out.last_message = str(verdict)
         self.status[node.id] = PASSED
-        self._pass_through(node.id)
+        self._carry_state(node.id, workspace)
         self.emit(
             node.id,
             ev(STATUS, f"條件 {expr} → {verdict}", phase="condition",
@@ -412,21 +410,18 @@ class Runner:
         )
         return "true" if verdict else "false"
 
-    def _pass_through(self, node_id: str) -> None:
-        """純資料節點不產生 commit，把上游的狀態原封不動往下傳。
+    def _carry_state(self, node_id: str, workspace: Workspace | None) -> None:
+        """不改檔案的節點：把它看到的狀態記為自己的產出，往下游傳。
 
-        少了這一步，per_node 模式下條件節點會把整條鏈的狀態斷掉 —— 下游節點
-        會從 run 的起始狀態重新開始，前面做的都不見了。
-
-        帶的是**所有**上游 commit 而不是第一個：條件節點可能自己就是 fan-in 點，
-        只留一個會把另一條平行分支的成果整個弄丟。真正的合併留給下一個有工作
-        目錄的節點做。
+        有工作目錄就用它的 HEAD（在 per_node 模式下那已經是「合併過所有上游」
+        的狀態，所以條件節點當 fan-in 點也不會弄丟任何分支）；沒有工作目錄的
+        只會是沒有入邊的需求節點，狀態就是 run 的起點。
         """
         if not self.per_node:
             return
-        bases = self._base_commits(node_id)
-        with self._commit_lock:
-            self.node_state[node_id] = bases
+        self._record_commit(
+            node_id, workspace.head() if workspace is not None else self.ctx.base_sha
+        )
 
     def _run_git(self, node: g.Node, out, workspace: Workspace | None) -> str:
         if workspace is None:
