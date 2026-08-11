@@ -19,8 +19,20 @@ from engine import graph as g
 from engine.bus import RunBus
 from engine.context import RunContext
 from engine.events import ERROR, STATUS, ev
+from engine.isolation import (
+    PER_NODE,
+    Isolation,
+    PerNodeIsolation,
+    SharedIsolation,
+    parse_mode,
+)
 from engine.runner import CANCELLED, FAILED, PASSED, Runner
-from engine.workspace import Workspace, WorkspaceError, create_workspace
+from engine.workspace import (
+    Workspace,
+    WorkspaceError,
+    create_workspace,
+    prepare_run_base,
+)
 from settings import Settings
 from store.db import Store
 
@@ -138,43 +150,69 @@ class RunService:
             handle.bus.publish("", {"kind": kind, "text": text, "data": data})
 
         workspace: Workspace | None = None
+        isolation: Isolation | None = None
         artifacts = self.settings.runs_dir / run_id / "artifacts"
+        mode = parse_mode(graph.settings)
 
         try:
-            workspace = create_workspace(
-                project_repo=self.settings.project_repo,
-                worktree_root=self.settings.worktree_root,
-                main_branch=self.settings.main_branch,
-                run_id=run_id,
-                tool_root=ROOT,
-            )
-            handle.workspace = workspace
-            self.store.start_run(
-                run_id, workspace.branch, workspace.base_sha, str(workspace.path)
-            )
+            if mode == PER_NODE:
+                # 刻意不開 run 層級的 worktree：task/<run-id> 必須保持沒有被
+                # 任何 worktree 佔用，否則跑完之後移動它會被 git 拒絕。
+                run_base = prepare_run_base(
+                    project_repo=self.settings.project_repo,
+                    main_branch=self.settings.main_branch,
+                    run_id=run_id,
+                    tool_root=ROOT,
+                )
+                repo, branch = run_base.repo, run_base.branch
+                base_sha, start_point = run_base.base_sha, run_base.start_point
+                workdir = str(self.settings.worktree_root / run_id)
+                isolation = PerNodeIsolation(
+                    repo=repo,
+                    worktree_root=self.settings.worktree_root,
+                    run_id=run_id,
+                    run_base_sha=base_sha,
+                    tool_root=ROOT,
+                )
+            else:
+                workspace = create_workspace(
+                    project_repo=self.settings.project_repo,
+                    worktree_root=self.settings.worktree_root,
+                    main_branch=self.settings.main_branch,
+                    run_id=run_id,
+                    tool_root=ROOT,
+                )
+                handle.workspace = workspace
+                repo, branch = workspace.repo, workspace.branch
+                base_sha, start_point = workspace.base_sha, workspace.start_point
+                workdir = str(workspace.path)
+                isolation = SharedIsolation(workspace=workspace)
+
+            self.store.start_run(run_id, branch, base_sha, workdir)
             emit_raw(
                 STATUS,
-                f"worktree 就緒: {workspace.path}（branch {workspace.branch}，"
-                f"基準 {workspace.start_point}）",
+                f"{'每節點各自的 worktree 會建在' if mode == PER_NODE else 'worktree 就緒:'}"
+                f" {workdir}（branch {branch}，基準 {start_point}，隔離模式 {mode}）",
                 phase="run_start",
-                branch=workspace.branch,
-                worktree=str(workspace.path),
+                branch=branch,
+                worktree=workdir,
+                isolation=mode,
             )
 
             ctx = RunContext(
                 run_id=run_id,
                 requirement=requirement,
-                branch=workspace.branch,
-                base_sha=workspace.base_sha,
-                workdir=str(workspace.path),
+                branch=branch,
+                base_sha=base_sha,
+                workdir=workdir,
                 tool_root=str(ROOT),
-                repo=str(workspace.repo),
+                repo=str(repo),
             )
 
             runner = Runner(
                 graph=graph,
                 context=ctx,
-                workspace=workspace,
+                isolation=isolation,
                 registry=self.registry,
                 guards=self.settings.guards,
                 emit=handle.bus.publish,
@@ -183,17 +221,29 @@ class RunService:
             )
             result = runner.run()
 
+            # per_node 模式下每個節點各有 branch，task/<run-id> 要指到終端節點的
+            # 產出，否則「變更」分頁與合併指令會看到一個空的 run branch。
+            if isinstance(isolation, PerNodeIsolation):
+                final = isolation.finalise(branch)
+                if final:
+                    emit_raw(
+                        STATUS,
+                        f"{branch} → {final[:12]}"
+                        f"（各節點的結果也留在 node/{run_id}/<node-id>）",
+                        phase="run_branch", branch=branch, commit=final,
+                    )
+
             self._persist_nodes(run_id, graph, ctx, result)
             self.store.finish_run(run_id, result.status, result.reason, result.steps)
 
             if result.status == PASSED:
                 emit_raw(
                     STATUS,
-                    f"✅ 完成。branch {workspace.branch} 已就緒，"
-                    f"人工檢查後可合併：git merge --no-ff {workspace.branch}",
+                    f"✅ 完成。branch {branch} 已就緒，"
+                    f"人工檢查後可合併：git merge --no-ff {branch}",
                     phase="run_end",
                     status=result.status,
-                    branch=workspace.branch,
+                    branch=branch,
                 )
             else:
                 emit_raw(
@@ -206,7 +256,9 @@ class RunService:
                 )
 
             if result.status == PASSED and self.settings.cleanup_worktree_on_success:
-                workspace.remove()
+                # per_node 模式會留下 N 個 worktree，全部要收掉
+                if isolation is not None:
+                    isolation.cleanup()
 
         except WorkspaceError as exc:
             self.store.finish_run(run_id, FAILED, str(exc), 0)

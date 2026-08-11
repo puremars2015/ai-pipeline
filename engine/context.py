@@ -109,7 +109,25 @@ class RunContext:
     def output(self, node_id: str) -> NodeOutput:
         return self.nodes.setdefault(node_id, NodeOutput())
 
-    def as_variables(self) -> dict[str, Any]:
+    def as_variables(
+        self,
+        *,
+        iteration: int | None = None,
+        diff: str | None = None,
+        changed_files: list[str] | None = None,
+        workdir: str | None = None,
+    ) -> dict[str, Any]:
+        """組出模板 / 運算式可見的變數。
+
+        每個節點各自的值（造訪次數、它看到的 diff、它的工作目錄）用參數傳進來，
+        不從共用的 context 讀。節點是並行跑的 —— 若先把這些值寫回 context 再讀，
+        兩個同時執行的節點會互相蓋掉，拿到對方的 loop.iteration 或 diff。
+        """
+        _iteration = self.iteration if iteration is None else iteration
+        _diff = self.diff if diff is None else diff
+        _changed = self.changed_files if changed_files is None else changed_files
+        _workdir = self.workdir if workdir is None else workdir
+
         return {
             "requirement": self.requirement,
             "run": wrap(
@@ -117,17 +135,17 @@ class RunContext:
                     "id": self.run_id,
                     "branch": self.branch,
                     "base_sha": self.base_sha,
-                    "diff": self.diff,
-                    "changed_files": self.changed_files,
-                    "workdir": self.workdir,
+                    "diff": _diff,
+                    "changed_files": _changed,
+                    "workdir": _workdir,
                     "repo": self.repo,
                 }
             ),
             "nodes": wrap({k: v.as_dict() for k, v in self.nodes.items()}),
-            "loop": wrap({"iteration": self.iteration}),
-            "diff": self.diff,
-            "changed_files": self.changed_files,
-            "workdir": self.workdir,
+            "loop": wrap({"iteration": _iteration}),
+            "diff": _diff,
+            "changed_files": _changed,
+            "workdir": _workdir,
             "tool_root": self.tool_root,
         }
 

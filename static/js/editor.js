@@ -358,8 +358,24 @@ function currentGraph() {
   return fromDrawflow(state.editor.export(), {
     id: state.workflowId,
     name: $('#wf-name').value || '未命名工作流',
-    settings: state.settings,
+    settings: { ...state.settings, isolation: $('#wf-isolation').value },
   });
+}
+
+/** 共用模式下會寫檔的節點是排隊跑的，把這件事直接寫在畫面上。 */
+function updateIsolationHint() {
+  const perNode = $('#wf-isolation').value === 'per_node';
+  const writers = currentGraph().nodes.filter((n) => {
+    const spec = state.specs.get(n.type);
+    const mutates = n.mutates === undefined ? spec?.mutates : n.mutates;
+    return mutates && !['requirement', 'condition'].includes(n.type);
+  }).length;
+
+  $('#isolation-hint').innerHTML = perNode
+    ? `<span class="text-sky-400">${writers} 個會寫檔的節點各自一個 worktree，可真平行；`
+      + `fan-in 時會合併，可能衝突</span>`
+    : `<span class="text-slate-500">${writers} 個會寫檔的節點共用一個 worktree，`
+      + `會排隊執行</span>`;
 }
 
 async function loadWorkflowList() {
@@ -378,10 +394,12 @@ async function loadWorkflow(id) {
   state.settings = graph.settings || {};
   $('#wf-name').value = state.workflowName;
   $('#wf-list').value = state.workflowId;
+  $('#wf-isolation').value = state.settings.isolation || 'shared';
 
   state.editor.import(toDrawflow(graph, nodeHtml));
   selectNode(null);
   fitView();
+  updateIsolationHint();
   status(`已載入「${state.workflowName}」`, 'ok');
   validate();
 }
@@ -436,6 +454,7 @@ async function run() {
 
 function markDirty() {
   status('未儲存的變更', 'warn');
+  updateIsolationHint();
   clearTimeout(markDirty._t);
   markDirty._t = setTimeout(validate, 400);
 }
@@ -459,6 +478,7 @@ $('#btn-save').addEventListener('click', save);
 $('#btn-run').addEventListener('click', run);
 $('#btn-validate').addEventListener('click', validate);
 $('#wf-list').addEventListener('change', (e) => loadWorkflow(e.target.value));
+$('#wf-isolation').addEventListener('change', markDirty);
 $('#btn-zoom-in').addEventListener('click', () => state.editor.zoom_in());
 $('#btn-zoom-out').addEventListener('click', () => state.editor.zoom_out());
 $('#btn-zoom-reset').addEventListener('click', fitView);

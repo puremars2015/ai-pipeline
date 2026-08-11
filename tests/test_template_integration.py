@@ -15,6 +15,7 @@ import pytest
 
 from adapters.registry import Registry
 from engine.context import RunContext
+from engine.isolation import SharedIsolation
 from engine.graph import parse, to_dict, validate
 from engine.runner import PASSED, Runner
 from engine.workspace import create_workspace
@@ -93,7 +94,7 @@ def run_template(graph_dict, ws, tmp_path, requirement="加上 feature 模組", 
     runner = Runner(
         graph=graph,
         context=ctx,
-        workspace=ws,
+        isolation=SharedIsolation(workspace=ws),
         registry=registry,
         guards=Guards(**{"default_node_timeout": 60, "run_timeout": 300, **guard_kw}),
         emit=rec,

@@ -323,5 +323,22 @@ def validate(graph: Graph, known_adapters: Iterable[str]) -> list[str]:
         if node.max_visits is not None and node.max_visits < 1:
             problems.append(f"節點 {node.label}：max_visits 必須 >= 1")
 
-    # 有環但沒有任何造訪上限來源 → 提醒（不是錯誤，設定檔有全域預設值）
+    problems.extend(_validate_settings(graph))
+    return problems
+
+
+def _validate_settings(graph: Graph) -> list[str]:
+    from engine.isolation import MODES  # 避免模組互相 import
+
+    problems: list[str] = []
+    isolation = graph.settings.get("isolation")
+    if isolation is not None and isolation not in MODES:
+        problems.append(
+            f"settings.isolation 只能是 {' / '.join(MODES)}，收到 {isolation!r}"
+        )
+
+    steps = graph.settings.get("max_run_steps")
+    if steps is not None and (not isinstance(steps, int) or steps < 1):
+        problems.append("settings.max_run_steps 必須是 >= 1 的整數")
+
     return problems

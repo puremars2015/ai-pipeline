@@ -1,6 +1,6 @@
 """排程器：把一張圖跑完。
 
-支援分支、迴圈、平行，並且在共用 worktree 的前提下保證寫入不會互相蓋掉。
+支援分支、迴圈、平行，以及兩種隔離模式（見 engine/isolation.py）。
 
 環的處理
 --------
@@ -10,13 +10,14 @@ QA 沒過打回去修正本質上就是一個環，所以圖允許有環。安�
 `all` join 的節點只等「前向入邊」—— 回頭邊不算。否則實作節點第一輪就會
 死等一個還沒跑過的 QA 節點。
 
-平行與共用 worktree 的衝突
---------------------------
-所有節點共用同一個 worktree。兩個會寫檔的節點同時跑會互相蓋掉，所以
-mutates=True 的節點必須搶同一把寫入鎖，實際上是序列化的。
-只有 mutates=False 的節點（read-only 的審查、跑測試以外的唯讀指令）才真的平行。
-等鎖的時候會發一則 status 事件，UI 要顯示出來 —— 不能讓使用者以為平行了
-卻在背後偷偷序列化。
+平行與隔離模式
+--------------
+**shared**：所有節點共用一個 worktree，會寫檔的節點搶同一把寫入鎖，實際序列化。
+等鎖時會發 status 事件 —— 不能讓使用者以為平行了卻在背後偷偷排隊。
+
+**per_node**：每個節點自己的 worktree，從上游的產出 commit 開始，不需要鎖，
+會寫檔的節點也真的平行。代價是每個節點跑完要自動 commit，而且 fan-in 的節點
+要合併多個上游，可能衝突。
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ from engine import graph as g
 from engine.context import ContextError, RunContext, evaluate, render_template
 from engine.events import ERROR, MESSAGE, STATUS, ev
 from engine.executor import Cancelled, NodeResult, execute
-from engine.workspace import Workspace
+from engine.isolation import PER_NODE, Isolation, PerNodeIsolation
+from engine.workspace import MergeConflict, Workspace
 from settings import Guards
 
 # emit(node_id, event_dict)
@@ -46,6 +48,9 @@ PASSED = "passed"
 FAILED = "failed"
 SKIPPED = "skipped"
 CANCELLED = "cancelled"
+
+# 這些節點型別純粹處理資料，不需要工作目錄；它們把上游的狀態原樣往下傳。
+PASSTHROUGH_TYPES = frozenset({g.REQUIREMENT, g.CONDITION})
 
 
 class RunAborted(Exception):
@@ -64,6 +69,8 @@ class RunResult:
     steps: int = 0
     node_status: dict[str, str] = field(default_factory=dict)
     visits: dict[str, int] = field(default_factory=dict)
+    # per_node 模式下每個節點的產出 commit，方便事後檢視某一段的結果
+    node_commits: dict[str, str] = field(default_factory=dict)
 
 
 class Runner:
@@ -71,7 +78,7 @@ class Runner:
         self,
         graph: g.Graph,
         context: RunContext,
-        workspace: Workspace | None,
+        isolation: Isolation | None,
         registry: Registry,
         guards: Guards,
         emit: EmitFn,
@@ -80,22 +87,23 @@ class Runner:
     ) -> None:
         self.graph = graph
         self.ctx = context
-        self.ws = workspace
+        self.isolation = isolation
         self.registry = registry
         self.guards = guards
         self._emit = emit
         self.artifacts = artifacts_dir
         self.cancel = cancel or threading.Event()
 
+        self.per_node = bool(isolation and isolation.mode == PER_NODE)
         self.back_edges = graph.back_edges()
         self.entry_ids = {n.id for n in graph.entrypoints()}
         self.arrived: dict[str, set[g.Edge]] = {nid: set() for nid in graph.nodes}
         self.visits: dict[str, int] = {nid: 0 for nid in graph.nodes}
         self.status: dict[str, str] = {nid: PENDING for nid in graph.nodes}
+        # per_node 模式：每個節點跑完留下的 commit，是下游節點的起始狀態
+        self.output_commit: dict[str, str] = {}
         self.steps = 0
-
-        # worktree 的寫入鎖：mutates 節點序列化，避免互相蓋檔
-        self.write_lock = threading.Lock()
+        self._commit_lock = threading.Lock()
 
     # ------------------------------------------------------------ 事件
 
@@ -174,6 +182,7 @@ class Runner:
         result.steps = self.steps
         result.node_status = dict(self.status)
         result.visits = dict(self.visits)
+        result.node_commits = dict(self.output_commit)
         return result
 
     def _abort(self, running: dict[Future, str]) -> None:
@@ -224,33 +233,108 @@ class Runner:
             return any(e in arrived for e in forward)
         return all(e in arrived for e in forward)
 
+    # -------------------------------------------------- per_node 狀態傳遞
+
+    def _base_commits(self, node_id: str) -> list[str]:
+        """這個節點該看到的上游狀態，第一個當 worktree 起點、其餘合併進來。
+
+        自己上一輪的產出排在最前面 —— 迴圈重入時要從自己的成果繼續，而不是
+        回到最初的狀態重做一遍。
+        """
+        commits: list[str] = []
+        with self._commit_lock:
+            own = self.output_commit.get(node_id)
+            if own:
+                commits.append(own)
+            for edge in self.graph.incoming(node_id):
+                upstream = self.output_commit.get(edge.src)
+                if upstream and upstream not in commits:
+                    commits.append(upstream)
+        if not commits:
+            commits.append(self.ctx.base_sha)
+        return commits
+
+    def _record_commit(self, node_id: str, commit: str) -> None:
+        with self._commit_lock:
+            self.output_commit[node_id] = commit
+        if isinstance(self.isolation, PerNodeIsolation):
+            self.isolation.record_commit(commit)
+
+    def _acquire(self, node_id: str) -> Workspace | None:
+        """取得節點的工作目錄。純資料節點不需要。"""
+        if self.isolation is None:
+            return None
+        node = self.graph.nodes[node_id]
+        if self.per_node and node.type in PASSTHROUGH_TYPES:
+            return None
+        return self.isolation.acquire(node_id, self._base_commits(node_id))
+
+    def _node_vars(
+        self, node_id: str, workspace: Workspace | None
+    ) -> dict[str, Any]:
+        """組出這個節點看到的變數。
+
+        造訪次數、diff、工作目錄都是「這個節點的」，用參數傳進 as_variables，
+        不寫回共用的 context —— 節點是並行跑的，寫回去會互相蓋掉。
+        """
+        diff = None
+        changed: list[str] | None = None
+        if workspace is not None:
+            diff = workspace.diff()
+            changed = workspace.changed_files()
+            # 同時更新 context 當作 run 的摘要（最後寫的贏，只用於紀錄與 UI）
+            self.ctx.diff = diff
+            self.ctx.changed_files = changed
+
+        return self.ctx.as_variables(
+            iteration=self.visits[node_id],
+            diff=diff,
+            changed_files=changed,
+            workdir=str(workspace.path) if workspace is not None else None,
+        )
+
     # ------------------------------------------------------- 單一節點
 
     def _run_node(self, node_id: str) -> str | None:
         """執行一個節點，回傳要往哪個 port 送 token（None = 不往下走）。"""
         node = self.graph.nodes[node_id]
-        self.ctx.iteration = self.visits[node_id]
         out = self.ctx.output(node_id)
         out.visits = self.visits[node_id]
 
         self.emit(
             node_id,
             ev(STATUS, f"▶ {node.label}", phase="node_start",
-               node_type=node.type, iteration=self.ctx.iteration),
+               node_type=node.type, iteration=self.visits[node_id]),
         )
 
         try:
+            workspace = self._acquire(node_id)
+            if workspace is not None and self.per_node:
+                self.emit(
+                    node_id,
+                    ev(STATUS, f"worktree {workspace.path.name} @ "
+                               f"{workspace.start_point[:12]}",
+                       phase="node_workspace", branch=workspace.branch,
+                       worktree=str(workspace.path),
+                       start_point=workspace.start_point),
+                )
+
             if node.type == g.REQUIREMENT:
                 port = self._run_requirement(node, out)
             elif node.type == g.CONDITION:
                 port = self._run_condition(node, out)
             elif node.type == g.GIT:
-                port = self._run_git(node, out)
+                port = self._run_git(node, out, workspace)
             else:
-                port = self._run_agent(node, out)
+                port = self._run_agent(node, out, workspace)
         except Cancelled:
             self.status[node_id] = CANCELLED
             raise
+        except MergeConflict as exc:
+            self.status[node_id] = FAILED
+            out.status = FAILED
+            self.emit(node_id, ev(ERROR, str(exc), conflicted_files=exc.files))
+            raise RunAborted(f"節點「{node.label}」合併上游結果失敗: {exc}") from exc
         except (ContextError, ValueError) as exc:
             self.status[node_id] = FAILED
             out.status = FAILED
@@ -270,15 +354,18 @@ class Runner:
         out.last_message = text
         out.status = PASSED
         self.status[node.id] = PASSED
+        # 純資料節點：把上游狀態原樣往下傳
+        self._pass_through(node.id)
         self.emit(node.id, ev(MESSAGE, text))
         return g.DEFAULT_PORT
 
     def _run_condition(self, node: g.Node, out) -> str:
         expr = node.config.get("expr") or ""
-        verdict = evaluate(expr, self.ctx.as_variables())
+        verdict = evaluate(expr, self._node_vars(node.id, None))
         out.status = PASSED
         out.last_message = str(verdict)
         self.status[node.id] = PASSED
+        self._pass_through(node.id)
         self.emit(
             node.id,
             ev(STATUS, f"條件 {expr} → {verdict}", phase="condition",
@@ -286,31 +373,45 @@ class Runner:
         )
         return "true" if verdict else "false"
 
-    def _run_git(self, node: g.Node, out) -> str:
-        if self.ws is None:
+    def _pass_through(self, node_id: str) -> None:
+        """純資料節點不產生 commit，把上游的狀態原封不動往下傳。
+
+        少了這一步，per_node 模式下條件節點會把整條鏈的狀態斷掉 —— 下游節點
+        會從 run 的起始狀態重新開始，前面做的都不見了。
+        """
+        if not self.per_node:
+            return
+        bases = self._base_commits(node_id)
+        with self._commit_lock:
+            self.output_commit[node_id] = bases[0]
+
+    def _run_git(self, node: g.Node, out, workspace: Workspace | None) -> str:
+        if workspace is None:
             raise ValueError("git 節點需要 worktree，但這個 run 沒有")
 
         action = node.config.get("action") or "commit"
         if action == "commit":
             message = render_template(
                 node.config.get("message") or "wip: {{ run.id }}",
-                self.ctx.as_variables(),
+                self._node_vars(node.id, workspace),
             )
-            with self.write_lock:
-                sha = self.ws.commit(message)
+            with self.isolation.write_lock():
+                sha = workspace.commit(message)
                 # commit 之後要重算 diff，否則下游的 QA 節點看到的是 commit 前
                 # 的舊快照（通常是空的）。
-                self._refresh_diff()
+                self._refresh_diff(workspace)
             # 沒有變更時 commit() 回 None，這不是錯誤 —— 舊 bash 在這裡
             # 因為 git commit 回非零加上 set -e 而炸掉整條流程。
             out.last_message = sha or "（沒有變更，未建立 commit）"
+            self._record_commit(node.id, sha or workspace.head())
             self.emit(
                 node.id,
                 ev(STATUS, out.last_message, phase="git_commit", sha=sha),
             )
         elif action == "diff":
-            self._refresh_diff()
+            self._refresh_diff(workspace)
             out.last_message = self.ctx.diff
+            self._record_commit(node.id, workspace.head())
             self.emit(
                 node.id,
                 ev(STATUS, f"diff {len(self.ctx.changed_files)} 個檔案",
@@ -323,12 +424,17 @@ class Runner:
         self.status[node.id] = PASSED
         return g.DEFAULT_PORT
 
-    def _run_agent(self, node: g.Node, out) -> str | None:
+    def _run_agent(self, node: g.Node, out, workspace: Workspace | None) -> str | None:
         spec = self.registry.get(node.type)
         normalizer = self.registry.normalizer(spec)
         mutates = spec.mutates if node.mutates is None else node.mutates
 
-        ctx_vars = self.ctx.as_variables()
+        workdir = str(workspace.path) if workspace else self.ctx.workdir
+
+        # _node_vars 會先算出這個節點的 worktree 目前的 diff，prompt 模板才引用得到
+        # {{ run.diff }}。per_node 模式下這一步是必要的：節點的 worktree 是剛從
+        # 上游 commit 建出來的，不重算就會拿到別的節點留下的 diff。
+        ctx_vars = self._node_vars(node.id, workspace)
 
         # 節點設定裡的字串本身也可以是模板（shell 的 command、git 的 message…），
         # 必須先渲染過再交給 adapter 組參數。adapter 的參數替換只有單層，
@@ -342,7 +448,7 @@ class Runner:
                 rendered_config[key] = render_template(value, ctx_vars)
 
         variables = {**spec.defaults(), **rendered_config, **ctx_vars}
-        variables["workdir"] = self.ctx.workdir
+        variables["workdir"] = workdir
         variables["tool_root"] = self.ctx.tool_root
 
         prompt = rendered_config.get("prompt") or ""
@@ -368,20 +474,30 @@ class Runner:
 
         timeout = node.timeout_sec or self.guards.default_node_timeout
 
-        if mutates:
-            if self.write_lock.locked():
+        def go() -> NodeResult:
+            return self._spawn(node, spec, normalizer, variables, prompt,
+                               timeout, last_message_file)
+
+        if not mutates:
+            result = go()
+            # 唯讀節點沒有產生新狀態，把上游的原樣往下傳
+            if workspace is not None and self.per_node:
+                self._record_commit(node.id, workspace.head())
+        elif self.isolation is not None and self.isolation.serialises_writes():
+            # 共用工作目錄：會寫檔的節點必須排隊，不能讓使用者以為在平行
+            if self.isolation.write_lock_held():
                 self.emit(
                     node.id,
-                    ev(STATUS, "等待 worktree 寫入鎖（會寫檔的節點不能平行）",
+                    ev(STATUS, "等待 worktree 寫入鎖（共用模式下會寫檔的節點不能平行）",
                        phase="await_lock"),
                 )
-            with self.write_lock:
-                result = self._spawn(node, spec, normalizer, variables, prompt,
-                                     timeout, last_message_file)
-                self._refresh_diff()
+            with self.isolation.write_lock():
+                result = go()
+                self._after_write(node, workspace)
         else:
-            result = self._spawn(node, spec, normalizer, variables, prompt,
-                                 timeout, last_message_file)
+            # per_node：各自有工作目錄，真的平行
+            result = go()
+            self._after_write(node, workspace)
 
         out.last_message = result.last_message
         out.structured = result.structured
@@ -409,6 +525,26 @@ class Runner:
         self.status[node.id] = PASSED
         return g.DEFAULT_PORT
 
+    def _after_write(self, node: g.Node, workspace: Workspace | None) -> None:
+        """會寫檔的節點跑完之後：更新 diff，per_node 模式還要自動 commit。"""
+        if workspace is None:
+            return
+
+        if self.isolation and self.isolation.needs_autocommit():
+            # per_node 模式下這個 commit 是必要的 —— 節點的成果只有變成 commit
+            # 才能交給下游的 worktree。沒有它，下游會看不到任何改動。
+            sha = workspace.commit(
+                f"{node.id}: 第 {self.visits[node.id]} 輪 [{self.ctx.run_id}]"
+            )
+            self._record_commit(node.id, sha or workspace.head())
+            if sha:
+                self.emit(
+                    node.id,
+                    ev(STATUS, f"自動 commit {sha[:12]}",
+                       phase="node_commit", sha=sha),
+                )
+        self._refresh_diff(workspace)
+
     def _spawn(self, node, spec, normalizer, variables, prompt, timeout,
                last_message_file) -> NodeResult:
         binary = self.registry.resolve_binary(spec)
@@ -431,13 +567,11 @@ class Runner:
             binary=binary,
         )
 
-    def _refresh_diff(self) -> None:
+    def _refresh_diff(self, workspace: Workspace) -> None:
         """更新 context 裡的 diff，讓下游的 QA 節點看到真實的變更。
 
         diff 只放在記憶體與 db，絕不寫進 worktree —— 舊 bash 把 changes.diff
         commit 進 repo，導致下一輪的 diff 包含上一輪的 diff，內容平方成長。
         """
-        if self.ws is None:
-            return
-        self.ctx.diff = self.ws.diff()
-        self.ctx.changed_files = self.ws.changed_files()
+        self.ctx.diff = workspace.diff()
+        self.ctx.changed_files = workspace.changed_files()

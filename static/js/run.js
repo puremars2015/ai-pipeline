@@ -266,6 +266,9 @@ function renderNodePane(nid) {
     ${out.structured !== null && out.structured !== undefined
         ? `<div class="sec"><div class="sec-t">結構化輸出</div><pre class="blk">${esc(JSON.stringify(out.structured, null, 2))}</pre></div>` : ''}
     ${out.last_message ? `<div class="sec"><div class="sec-t">最終回覆</div><pre class="blk">${esc(out.last_message)}</pre></div>` : ''}
+    ${/* shell 節點沒有 normalizer，輸出走 stdout 不是 message，所以要另外顯示 */''}
+    ${out.stdout && out.stdout !== out.last_message
+        ? `<div class="sec"><div class="sec-t">stdout</div><pre class="blk">${esc(out.stdout)}</pre></div>` : ''}
     <div class="sec"><div class="sec-t">這個節點的事件（${e.events.length}）</div>
       ${e.events.filter((x) => !NOISY.has(x.kind)).slice(-40).map((x) =>
         `<div class="text-[11px] text-slate-400"><span class="text-slate-600">${KIND_ICON[x.kind] || '·'}</span> ${esc((x.text || '').slice(0, 200))}</div>`).join('')}

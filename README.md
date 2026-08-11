@@ -1,7 +1,7 @@
 # AI Workflow Builder
 
 在畫布上拖曳節點、連線組出自己的 AI 工作流。節點可以是 `codex`、`claude`、
-`opencode`、shell 指令、條件判斷、git 操作。執行時每個節點的進度、agent 的
+`opencode`、`pi`、shell 指令、條件判斷、git 操作。執行時每個節點的進度、agent 的
 工具呼叫、改了哪些檔案都即時顯示在同一張圖上。
 
 流程定義是資料，不是程式碼 —— 改流程是拖線，不是改 bash。
@@ -47,7 +47,7 @@ printf 'project_repo: "~/你的專案路徑"\n' > config.local.yaml
 | 節點 | 用途 | 給下游的輸出 |
 |---|---|---|
 | **需求** | run 的起點 | `requirement` |
-| **Codex / Claude Code / opencode** | 呼叫 agent CLI | `last_message`、`structured`、`session_id`、`files`、`usage` |
+| **Codex / Claude Code / opencode / pi** | 呼叫 agent CLI | `last_message`、`structured`、`session_id`、`files`、`usage` |
 | **Shell 指令** | 跑測試、lint、build | `stdout`、`exit_code` |
 | **條件判斷** | 依運算式選 true / false 出口 | — |
 | **Git** | commit、重算 diff | `diff`、`sha` |
@@ -90,20 +90,52 @@ nodes.qa.structured.verdict == 'PASS' and nodes.tests.exit_code == 0
 
 ## 隔離模型
 
-每次 run 開一個獨立 git worktree + `task/<run-id>` branch，所有節點在裡面
-接力。**不會動到你手上的工作目錄**，也不會自動合併 —— 跑完留在 branch 上，
-UI 的「變更」分頁直接給你合併指令。
+無論哪種模式，都**不會動到你手上的工作目錄**，也不會自動合併 —— 跑完留在
+branch 上，UI 的「變更」分頁直接給你合併指令。`plan.md` / QA 報告之類的產物
+存在 `runs/<run-id>/artifacts/`，在 repo 之外，不會混進 `main`。
 
-`plan.md` / QA 報告之類的產物存在 `runs/<run-id>/artifacts/`，在 repo 之外，
-不會混進 `main`。
+模式在編輯器工具列切換（存進工作流的 `settings.isolation`）。
 
-### 平行執行的限制
+### `shared`（預設）
 
-所有節點共用一個 worktree，所以會寫檔的節點（`mutates=true`）搶同一把寫入鎖，
-實際上是序列化的；只有唯讀節點（審查、規劃、read-only 指令）真的平行。
-節點在等鎖時會發事件，UI 會顯示 —— 不會讓你以為平行了卻在背後偷偷排隊。
+整個 run 一個 worktree + `task/<run-id>` branch，所有節點在裡面接力。
+會寫檔的節點（`mutates=true`）搶同一把寫入鎖，**實際上是序列化的**；
+只有唯讀節點（審查、規劃、read-only 指令）真的平行。節點在等鎖時會發事件，
+UI 會顯示 —— 不會讓你以為平行了卻在背後偷偷排隊。
 
-想真正平行寫入需要每節點各自的 worktree，目前不支援。
+簡單、diff 一路累積、要不要 commit 由你用 git 節點明確決定。
+
+### `per_node`
+
+每個節點自己的 worktree + `node/<run-id>/<node-id>` branch，從上游節點的產出
+commit 開始。沒有共用狀態就不需要鎖，**會寫檔的節點也真的平行**。
+
+```
+              ┌── 改模組 A ──┐        各自一個 worktree
+需求 ─────────┤              ├── 合流   合流時 merge 兩邊的 commit
+              └── 改模組 B ──┘
+```
+
+代價是三件事，都是真的：
+
+1. **每個會寫檔的節點跑完會自動 commit**。狀態只有變成 commit 才交得給下游，
+   所以這步是必要的，不是可選的。
+2. **fan-in 要合併多個上游，可能衝突**。兩個平行節點改到同一處，會在合流的
+   節點上失敗，錯誤訊息會列出衝突檔案。要避免就讓平行的節點碰不同的檔案。
+3. **磁碟用量是「節點數 × repo 大小」**。大 repo 要留意。
+
+`task/<run-id>` 會指到**最後一個成功完成的節點**的產出，所以「變更」分頁與
+合併指令照樣可用。想看某一段的中間結果，去看它自己的 `node/<run-id>/<node-id>`。
+
+迴圈重入時，節點會從**自己上一輪的 commit** 繼續，不是回到 run 起點重做。
+
+兩個實作上的 git 細節（踩過才知道）：
+
+- 節點的 branch 不能叫 `task/<run-id>/<node-id>` —— git 的 ref 存成檔案，
+  `refs/heads/task/<run-id>` 一存在就不可能再有同名目錄底下的 ref。所以用
+  `node/` 另一個前綴。
+- `per_node` 模式刻意**不**開 run 層級的 worktree：`task/<run-id>` 必須保持
+  沒有被任何 worktree 佔用，否則跑完之後 `git branch -f` 會被 git 拒絕。
 
 ## 接一個新的 agent CLI
 
@@ -120,13 +152,17 @@ adapters/normalizers/<id>.py    # 怎麼解讀它的事件輸出
 .venv/bin/python -m tools.probe <id>      # 實跑一次，存成 tests/fixtures/<id>.jsonl
 ```
 
-三個內建 adapter 的 normalizer 都是照 probe 抓回來的 fixture 寫的，
-CLI 升版後重跑 probe，測試就會抓到 schema 變動。
+內建 adapter 的 normalizer 都是照 probe 抓回來的 fixture 寫的，CLI 升版後重跑
+probe，測試就會抓到 schema 變動。每份 fixture 的來源與可信度記在
+`tests/fixtures/README.md`（pi 的部分因為本機沒憑證，是依它自己的 docs/json.md
+與 types.d.ts 構造的，設定憑證後請重跑 probe 覆蓋）。
+
+CLI 不在 PATH 上時，yaml 可以用 `binary_candidates` 列候選絕對路徑。
 
 ## 開發
 
 ```bash
-.venv/bin/python -m pytest -q          # 154 個測試，不呼叫 LLM
+.venv/bin/python -m pytest -q          # 192 個測試，不呼叫 LLM
 .venv/bin/python -m tools.watch <run>  # 在終端機盯一個 run
 ```
 
@@ -152,6 +188,11 @@ QA 看得到並會據此判斷，不會把略過當成通過。
 
 **codex 會把診斷訊息混進 JSONL。** normalizer 必須容忍非 JSON 行，已處理。
 
+**pi 需要先設定 provider 憑證**，而且它即使加了 `-p` 也會讀 stdin —— 沒關掉
+就會無限等待。本工具一律關閉 stdin，但你自己在終端機試的時候要記得。
+`pi` 常裝在自帶的 node 發行版底下（例如 `~/.hermes/node/bin`），不在 PATH 上也能用，
+adapter 的 `binary_candidates` 有列候選位置。
+
 ## 檔案結構
 
 ```
@@ -160,6 +201,7 @@ settings.py               config.yaml + config.local.yaml 疊加載入
 engine/
   graph.py                正規格式的解析與驗證（環、孤島、必填設定）
   runner.py               排程：join / fan-out / 環 / 寫入鎖 / 三道上限
+  isolation.py            shared / per_node 兩種隔離模式
   executor.py             跑 subprocess、串流事件、timeout 與取消
   context.py              節點間資料傳遞、Jinja 渲染、安全運算式求值
   workspace.py            worktree 生命週期 + 拒絕在 $HOME 上動手

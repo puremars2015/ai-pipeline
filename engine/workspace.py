@@ -20,6 +20,18 @@ class WorkspaceError(Exception):
     """worktree / repo 操作失敗，或目標 repo 不安全。"""
 
 
+class MergeConflict(WorkspaceError):
+    """合併多個上游節點的結果時發生衝突。
+
+    這是每節點獨立 worktree 模式下的真實風險：兩個平行節點改到同一個地方，
+    在 fan-in 的節點上才會撞到。錯誤訊息要列出衝突檔案，不然使用者無從下手。
+    """
+
+    def __init__(self, message: str, files: list[str]) -> None:
+        super().__init__(message)
+        self.files = files
+
+
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", *args],
@@ -108,13 +120,21 @@ def resolve_start_point(repo: Path, main_branch: str) -> str:
 
 @dataclass
 class Workspace:
-    """一個 run 專屬的 worktree。所有節點共用這一份工作目錄。"""
+    """一個 worktree。
+
+    共用模式下整個 run 只有一個；每節點模式下每個節點各有一個。
+
+    base_sha 一律是「run 的起始 commit」，diff 都相對於它算 —— 這樣下游的審查
+    節點看到的是本次 run 累積下來的完整變更，而不是只有上一個節點做的那一小段。
+    start_point 才是這個 worktree 實際被建立的位置。
+    """
 
     repo: Path
     path: Path
     branch: str
     base_sha: str
     start_point: str
+    node_id: str = ""
 
     @property
     def workdir(self) -> Path:
@@ -164,6 +184,145 @@ class Workspace:
         if self.path.exists():
             shutil.rmtree(self.path, ignore_errors=True)
         _git(["worktree", "prune"], cwd=self.repo, check=False)
+
+
+def merge_into(workspace: Workspace, commits: list[str]) -> None:
+    """把額外的 commit 合併進 worktree。衝突時 abort 並丟出 MergeConflict。
+
+    合併失敗一定要把工作目錄還原乾淨（--abort），否則接下來的節點會在一個
+    半合併狀態的目錄上動手，錯得更難查。
+    """
+    for commit in commits:
+        # 已經是祖先就不用合（fast-forward 或 up-to-date）
+        if _git(["merge-base", "--is-ancestor", commit, "HEAD"],
+                cwd=workspace.path, check=False).returncode == 0:
+            continue
+
+        proc = _git(
+            ["merge", "--no-edit", "-m", f"merge {commit[:12]}", commit],
+            cwd=workspace.path,
+            check=False,
+        )
+        if proc.returncode == 0:
+            continue
+
+        conflicted = [
+            line
+            for line in _git(
+                ["diff", "--name-only", "--diff-filter=U"],
+                cwd=workspace.path, check=False,
+            ).stdout.splitlines()
+            if line
+        ]
+        _git(["merge", "--abort"], cwd=workspace.path, check=False)
+        raise MergeConflict(
+            f"合併上游結果時發生衝突（{commit[:12]}）於 {len(conflicted)} 個檔案:\n"
+            + "\n".join(f"  - {f}" for f in conflicted)
+            + "\n兩個平行節點改到了同一個地方。請調整工作流讓它們不要碰同一批檔案，"
+            "或把其中一段改成序列執行。",
+            conflicted,
+        )
+
+
+@dataclass(frozen=True)
+class RunBase:
+    """一個 run 的基準，但沒有 checkout 出來的工作目錄。
+
+    per_node 模式用這個而不是 create_workspace：run 層級的 branch 必須保持
+    「沒有被任何 worktree 佔用」，否則跑完之後 `git branch -f` 會被 git 拒絕
+    （cannot force update the branch … used by worktree at …）。
+    順帶也少一份完整 checkout 的磁碟開銷。
+    """
+
+    repo: Path
+    branch: str
+    base_sha: str
+    start_point: str
+
+
+def prepare_run_base(
+    project_repo: Path,
+    main_branch: str,
+    run_id: str,
+    tool_root: Path | None = None,
+) -> RunBase:
+    """驗證目標 repo、決定起點、建立（未 checkout 的）run branch。"""
+    repo = validate_project_repo(project_repo, tool_root=tool_root)
+    start_point = resolve_start_point(repo, main_branch)
+    base_sha = _git(["rev-parse", start_point], cwd=repo).stdout.strip()
+
+    branch = f"task/{run_id}"
+    if _git(["rev-parse", "--verify", branch], cwd=repo, check=False).returncode == 0:
+        raise WorkspaceError(f"分支已存在: {branch}")
+    _git(["branch", branch, base_sha], cwd=repo)
+
+    return RunBase(repo=repo, branch=branch, base_sha=base_sha, start_point=start_point)
+
+
+def node_branch(run_id: str, node_id: str) -> str:
+    """節點層級的 branch 名稱。
+
+    刻意不放在 task/<run-id>/ 底下 —— git 的 ref 存成檔案，
+    refs/heads/task/<run-id> 一存在就不可能再有 refs/heads/task/<run-id>/<node-id>。
+    """
+    return f"node/{run_id}/{node_id}"
+
+
+def create_node_workspace(
+    repo: Path,
+    worktree_root: Path,
+    run_id: str,
+    node_id: str,
+    base_commits: list[str],
+    run_base_sha: str,
+    tool_root: Path | None = None,
+) -> Workspace:
+    """為單一節點建立獨立 worktree，從上游節點的產出 commit 開始。
+
+    base_commits 是這個節點該看到的所有上游狀態（含它自己上一輪的產出，
+    迴圈重入時才不會把前一輪的成果丟掉）。第一個當起點，其餘合併進來。
+
+    每次造訪都用 -B 重設 branch 並重建目錄 —— 狀態全在 commit 裡，重建是安全的，
+    而且比去推理「這個目錄現在是什麼狀態」可靠得多。
+    """
+    if not base_commits:
+        raise WorkspaceError(f"節點 {node_id} 沒有可用的起始 commit")
+
+    # 不能用 task/<run-id>/<node-id>：git 的 ref 是檔案系統上的檔案，
+    # refs/heads/task/<run-id> 存在時就不可能再建 refs/heads/task/<run-id>/<node-id>
+    # （會是 "cannot lock ref: … exists; cannot create …"）。所以節點的 branch
+    # 換一個獨立的前綴，跟 run 層級的 task/<run-id> 不相干。
+    branch = node_branch(run_id, node_id)
+    path = (worktree_root / run_id / node_id).resolve()
+
+    # 重建：先拆掉舊的（同一節點的前一輪），再從新的起點開
+    _git(["worktree", "remove", "--force", str(path)], cwd=repo, check=False)
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    _git(["worktree", "prune"], cwd=repo, check=False)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(["worktree", "add", "-B", branch, str(path), base_commits[0]], cwd=repo)
+
+    workspace = Workspace(
+        repo=repo,
+        path=path,
+        branch=branch,
+        base_sha=run_base_sha,
+        start_point=base_commits[0],
+        node_id=node_id,
+    )
+    merge_into(workspace, base_commits[1:])
+    return workspace
+
+
+def point_branch_at(repo: Path, branch: str, commit: str) -> None:
+    """把 branch 指到某個 commit（不切換工作目錄）。
+
+    用來讓 task/<run-id> 指向終端節點的產出，這樣「變更」分頁與合併指令
+    在每節點模式下也照樣可用。
+    """
+    _git(["branch", "-f", branch, commit], cwd=repo)
 
 
 def create_workspace(

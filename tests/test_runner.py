@@ -16,6 +16,7 @@ import pytest
 from adapters.registry import Registry
 from engine import runner as R
 from engine.context import RunContext
+from engine.isolation import SharedIsolation
 from engine.graph import parse, validate
 from engine.runner import CANCELLED, FAILED, PASSED, Runner
 from settings import Guards
@@ -91,7 +92,8 @@ def build(payload, registry, tmp_path, workspace=None, **guard_kw):
     run = Runner(
         graph=graph,
         context=ctx,
-        workspace=workspace,
+        # 沒有 worktree 也要用 SharedIsolation：節點仍共用一個目錄，寫入必須序列化
+        isolation=SharedIsolation(workspace=workspace),
         registry=registry,
         guards=guards,
         emit=rec,
