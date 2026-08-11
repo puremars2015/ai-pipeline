@@ -293,7 +293,18 @@ def create_node_workspace(
     # （會是 "cannot lock ref: … exists; cannot create …"）。所以節點的 branch
     # 換一個獨立的前綴，跟 run 層級的 task/<run-id> 不相干。
     branch = node_branch(run_id, node_id)
-    path = (worktree_root / run_id / node_id).resolve()
+
+    # 路徑必須確認落在 run 目錄之內才敢刪。graph 那層已經限制了 node_id 的格式，
+    # 這裡是第二道防線 —— 底下有 rmtree，不能只靠上游驗證過。
+    run_dir = (worktree_root / run_id).resolve()
+    path = (run_dir / node_id).resolve()
+    if path == run_dir or run_dir not in path.parents:
+        raise WorkspaceError(
+            f"節點 id 會讓工作目錄逃出 {run_dir}: {node_id!r} → {path}"
+        )
+    if _git(["check-ref-format", "--branch", branch], cwd=repo,
+            check=False).returncode != 0:
+        raise WorkspaceError(f"節點 id 組不出合法的 git branch 名稱: {node_id!r}")
 
     # 重建：先拆掉舊的（同一節點的前一輪），再從新的起點開
     _git(["worktree", "remove", "--force", str(path)], cwd=repo, check=False)
@@ -314,6 +325,48 @@ def create_node_workspace(
     )
     merge_into(workspace, base_commits[1:])
     return workspace
+
+
+def is_ancestor(repo: Path, maybe_ancestor: str, descendant: str) -> bool:
+    return (
+        _git(["merge-base", "--is-ancestor", maybe_ancestor, descendant],
+             cwd=repo, check=False).returncode == 0
+    )
+
+
+def tip_commits(repo: Path, commits: list[str]) -> list[str]:
+    """從一堆 commit 裡挑出「沒有被其他人包含」的那些。
+
+    per_node 模式收尾時要決定 run 的最終狀態。圖可以 fan-out 成兩個各自結束的
+    分支，兩邊的 commit 互不包含 —— 只挑「最後完成的那個」會靜默漏掉另一邊。
+    先算出所有 tip，再全部合併起來才是完整的結果。
+    """
+    unique: list[str] = []
+    for commit in commits:
+        if commit and commit not in unique:
+            unique.append(commit)
+    return [
+        commit
+        for commit in unique
+        if not any(
+            other != commit and is_ancestor(repo, commit, other) for other in unique
+        )
+    ]
+
+
+def diff_between(repo: Path, base: str, head: str) -> tuple[str, list[str]]:
+    """兩個 commit 之間的 diff。不需要 worktree。
+
+    給沒有工作目錄的節點用（per_node 模式下的條件 / 需求節點）—— 它們仍然可能
+    在運算式裡引用 run.diff 或 run.changed_files。
+    """
+    if not base or not head or base == head:
+        return "", []
+    diff = _git(["diff", f"{base}..{head}"], cwd=repo, check=False).stdout
+    names = _git(
+        ["diff", "--name-only", f"{base}..{head}"], cwd=repo, check=False
+    ).stdout
+    return diff, [line for line in names.splitlines() if line]
 
 
 def point_branch_at(repo: Path, branch: str, commit: str) -> None:

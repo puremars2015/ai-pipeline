@@ -82,16 +82,33 @@ class Registry:
         return list(self._specs.values())
 
     def normalizer(self, spec: AdapterSpec) -> Normalizer | None:
-        """取得 spec 對應的 normalize 函式；沒有就回 None（呼叫端退回純文字）。"""
+        """取得 spec 對應的事件翻譯函式；沒有就回 None（呼叫端退回純文字）。
+
+        normalizer 模組可以二選一：
+
+        - `normalize(raw)` —— 無狀態，整個行程共用一份（會被快取）
+        - `make_normalizer()` —— 回傳一個**每次執行都是新的**可呼叫物件，
+          給需要跨事件記狀態的 adapter 用（例如 pi 要把 tool_execution_start
+          的參數記下來，等對應的 end 成功了才回報檔案改動）
+
+        有 make_normalizer 就絕不快取 —— 狀態跨節點共用會讓並行執行互相污染。
+        """
         if not spec.normalizer:
             return None
+
+        module = importlib.import_module(f"adapters.normalizers.{spec.normalizer}")
+
+        factory = getattr(module, "make_normalizer", None)
+        if factory is not None:
+            return factory()
+
         if spec.normalizer in self._normalizers:
             return self._normalizers[spec.normalizer]
-        module = importlib.import_module(f"adapters.normalizers.{spec.normalizer}")
         func = getattr(module, "normalize", None)
         if func is None:
             raise AdapterError(
-                f"adapters/normalizers/{spec.normalizer}.py 沒有 normalize()"
+                f"adapters/normalizers/{spec.normalizer}.py 需要 normalize() "
+                f"或 make_normalizer()"
             )
         self._normalizers[spec.normalizer] = func
         return func

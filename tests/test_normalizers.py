@@ -33,7 +33,18 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def run_fixture(normalize, name: str) -> list[dict]:
-    """把 fixture 每一行餵進 normalizer，非 JSON 行以 str 傳入（模擬 runner 行為）。"""
+    """把 fixture 每一行餵進 normalizer，非 JSON 行以 str 傳入（模擬 runner 行為）。
+
+    模組若提供 make_normalizer()（需要跨事件記狀態的 adapter），就取一份新的實例
+    —— 跟 registry 在正式執行時做的事一樣。
+    """
+    module = getattr(normalize, "__module__", None)
+    if module:
+        import importlib
+        factory = getattr(importlib.import_module(module), "make_normalizer", None)
+        if factory is not None:
+            normalize = factory()
+
     events: list[dict] = []
     for line in (FIXTURES / name).read_text("utf-8").splitlines():
         line = line.strip()
@@ -388,27 +399,77 @@ def test_pi_tool_error_surfaces():
     assert out[0]["data"]["is_error"] is True
 
 
-def test_pi_file_edit_comes_from_start_not_end():
-    """tool_execution_end 沒有 args，拿不到路徑，所以 file_edit 只能在 start 發。"""
-    start = pi_norm.normalize({
+def test_pi_file_edit_only_after_the_write_succeeds():
+    """檔案改動要等工具真的成功才回報。
+
+    tool_execution_end 沒有 args，所以路徑必須在 start 時記下來、end 時才用 ——
+    normalizer 因此需要每次執行獨立的狀態（make_normalizer）。
+    NodeResult.files 是會被持久化的節點產出，失敗的 write 不該讓它宣稱改過檔案。
+    """
+    norm = pi_norm.make_normalizer()
+
+    start = norm({
         "type": "tool_execution_start", "toolCallId": "t1", "toolName": "write",
         "args": {"path": "a.py", "absolutePath": "/wt/a.py", "content": "x"},
     })
-    assert kinds(start) == [TOOL_CALL, FILE_EDIT]
-    assert start[1]["data"]["paths"] == ["/wt/a.py"]
+    assert kinds(start) == [TOOL_CALL], "還沒確認成功，不該先報改動"
 
-    end = pi_norm.normalize({
+    end = norm({
         "type": "tool_execution_end", "toolCallId": "t1", "toolName": "write",
         "result": {"output": "ok"}, "isError": False,
     })
-    assert kinds(end) == [TOOL_RESULT], "end 不該再發一次 file_edit"
+    assert kinds(end) == [TOOL_RESULT, FILE_EDIT]
+    assert end[1]["data"]["paths"] == ["/wt/a.py"]
 
-    # 唯讀工具不算檔案改動
-    read = pi_norm.normalize({
-        "type": "tool_execution_start", "toolCallId": "t2", "toolName": "read",
-        "args": {"path": "a.py"},
+
+def test_pi_failed_write_is_not_reported_as_a_file_change():
+    norm = pi_norm.make_normalizer()
+    norm({
+        "type": "tool_execution_start", "toolCallId": "t1", "toolName": "write",
+        "args": {"path": "denied.py", "absolutePath": "/wt/denied.py"},
     })
-    assert kinds(read) == [TOOL_CALL]
+    end = norm({
+        "type": "tool_execution_end", "toolCallId": "t1", "toolName": "write",
+        "result": {"output": "permission denied"}, "isError": True,
+    })
+    assert kinds(end) == [TOOL_RESULT]
+    assert end[0]["data"]["is_error"] is True
+
+
+def test_pi_normalizer_state_is_per_execution():
+    """兩個並行節點各自一份狀態，不能互相污染。"""
+    a, b = pi_norm.make_normalizer(), pi_norm.make_normalizer()
+    a({"type": "tool_execution_start", "toolCallId": "same-id", "toolName": "write",
+       "args": {"path": "from_a.py"}})
+    # b 沒見過這個 callId，不該憑 a 記下的路徑報出改動
+    out = b({"type": "tool_execution_end", "toolCallId": "same-id",
+             "toolName": "write", "result": {}, "isError": False})
+    assert kinds(out) == [TOOL_RESULT]
+
+
+def test_pi_readonly_tool_is_not_a_file_change():
+    norm = pi_norm.make_normalizer()
+    norm({"type": "tool_execution_start", "toolCallId": "t2", "toolName": "read",
+          "args": {"path": "a.py"}})
+    end = norm({"type": "tool_execution_end", "toolCallId": "t2",
+                "toolName": "read", "result": {"output": "..."}, "isError": False})
+    assert kinds(end) == [TOOL_RESULT]
+
+
+def test_pi_recoverable_tool_error_does_not_fail_the_node():
+    """工具失敗對 agent 是可恢復的，不能翻譯成 ERROR 事件。
+
+    executor 只要看到任何 ERROR 就會設定 result.error，於是 runner 會把一個
+    其實成功結束（exit 0）的節點判成失敗。
+    """
+    norm = pi_norm.make_normalizer()
+    out = norm({
+        "type": "message_end",
+        "message": {"role": "toolResult", "toolCallId": "t1", "toolName": "bash",
+                    "content": [{"type": "text", "text": "exit 1"}],
+                    "isError": True},
+    })
+    assert out == [], "toolResult 的 isError 不該產生 ERROR 事件"
 
 
 def test_pi_assistant_error_message():

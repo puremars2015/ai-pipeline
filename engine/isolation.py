@@ -30,6 +30,7 @@ from engine.workspace import (
     Workspace,
     create_node_workspace,
     point_branch_at,
+    tip_commits,
 )
 
 SHARED = "shared"
@@ -54,9 +55,6 @@ class Isolation(Protocol):
 
     def needs_autocommit(self) -> bool:
         """節點跑完是否必須自動 commit 才能把狀態傳給下游。"""
-
-    def run_branch_commit(self) -> str | None:
-        """整個 run 對外代表的 commit（給 task/<run-id> 用）。"""
 
     def cleanup(self) -> None: ...
 
@@ -89,9 +87,6 @@ class SharedIsolation:
         # 共用模式下要不要 commit 由使用者用 git 節點明確決定
         return False
 
-    def run_branch_commit(self) -> str | None:
-        return None  # branch 本來就在這個 worktree 上，不用另外指
-
     def cleanup(self) -> None:
         if self.workspace is not None:
             self.workspace.remove()
@@ -109,9 +104,10 @@ class PerNodeIsolation:
     mode: str = PER_NODE
     # node_id -> 該節點目前的 worktree
     workspaces: dict[str, Workspace] = field(default_factory=dict)
-    # 依完成順序記錄的最後一個產出 commit
-    last_commit: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    # 收尾用的整合 worktree 名稱（合併多個終端分支時才會建）
+    INTEGRATE = "__integrate"
 
     def acquire(self, node_id: str, base_commits: list[str]) -> Workspace:
         # git worktree add / remove 會動到共用的 .git，不能真的並行呼叫
@@ -141,23 +137,39 @@ class PerNodeIsolation:
     def needs_autocommit(self) -> bool:
         return True
 
-    def record_commit(self, commit: str) -> None:
-        with self._lock:
-            self.last_commit = commit
+    def finalise(self, run_branch: str, commits: list[str]) -> str | None:
+        """讓 task/<run-id> 代表整個 run 的完整結果。
 
-    def run_branch_commit(self) -> str | None:
-        return self.last_commit
+        不能用「最後完成的那個 commit」—— 圖可以 fan-out 成兩個各自結束的分支，
+        兩邊的 commit 互不包含，挑一個就會靜默漏掉另一邊，而且挑到哪個還取決於
+        執行時序。做法是先算出所有 tip（沒有被其他人包含的 commit），只有一個就
+        直接指過去，多個就在一個獨立的整合 worktree 裡合併起來。
 
-    def finalise(self, run_branch: str) -> str | None:
-        """讓 task/<run-id> 指向最後一個產出 commit。
-
-        規則刻意選成「最後一個成功完成的節點的產出」—— 定義明確、隨時算得出來。
-        想看特定節點的結果，它自己的 branch task/<run-id>/<node-id> 還在。
+        合併衝突會往外丟 MergeConflict —— 呼叫端應該讓整個 run 失敗，
+        而不是安靜地只採用其中一邊。
         """
-        if self.last_commit is None:
+        tips = tip_commits(self.repo, [c for c in commits if c])
+        if not tips:
             return None
-        point_branch_at(self.repo, run_branch, self.last_commit)
-        return self.last_commit
+
+        if len(tips) == 1:
+            point_branch_at(self.repo, run_branch, tips[0])
+            return tips[0]
+
+        integrate = create_node_workspace(
+            repo=self.repo,
+            worktree_root=self.worktree_root,
+            run_id=self.run_id,
+            node_id=self.INTEGRATE,
+            base_commits=tips,
+            run_base_sha=self.run_base_sha,
+            tool_root=self.tool_root,
+        )
+        with self._lock:
+            self.workspaces[self.INTEGRATE] = integrate
+        merged = integrate.head()
+        point_branch_at(self.repo, run_branch, merged)
+        return merged
 
     def cleanup(self) -> None:
         for workspace in self.workspaces.values():

@@ -221,17 +221,25 @@ class RunService:
             )
             result = runner.run()
 
-            # per_node 模式下每個節點各有 branch，task/<run-id> 要指到終端節點的
-            # 產出，否則「變更」分頁與合併指令會看到一個空的 run branch。
-            if isinstance(isolation, PerNodeIsolation):
-                final = isolation.finalise(branch)
-                if final:
-                    emit_raw(
-                        STATUS,
-                        f"{branch} → {final[:12]}"
-                        f"（各節點的結果也留在 node/{run_id}/<node-id>）",
-                        phase="run_branch", branch=branch, commit=final,
-                    )
+            # per_node 模式下每個節點各有 branch，task/<run-id> 要代表整個 run
+            # 的完整結果，否則「變更」分頁與合併指令會漏掉某些分支的成果。
+            if isinstance(isolation, PerNodeIsolation) and result.status == PASSED:
+                try:
+                    final = isolation.finalise(branch, runner.passed_commits())
+                except WorkspaceError as exc:
+                    # 終端分支合不起來，整個 run 就不算成功 —— 絕不能安靜地
+                    # 只採用其中一邊，那會讓使用者以為全部都併進去了。
+                    result.status = FAILED
+                    result.reason = f"整合各分支的結果失敗: {exc}"
+                    emit_raw(ERROR, result.reason, phase="run_integrate")
+                else:
+                    if final:
+                        emit_raw(
+                            STATUS,
+                            f"{branch} → {final[:12]}"
+                            f"（各節點的結果也留在 node/{run_id}/<node-id>）",
+                            phase="run_branch", branch=branch, commit=final,
+                        )
 
             self._persist_nodes(run_id, graph, ctx, result)
             self.store.finish_run(run_id, result.status, result.reason, result.steps)

@@ -444,7 +444,7 @@ def test_run_branch_points_at_final_commit(repo_and_base, tmp_path):
     result, _, _, iso = run_per_node(payload, repo, base, tmp_path)
     assert result.status == PASSED, result.reason
 
-    final = iso.finalise(base.branch)
+    final = iso.finalise(base.branch, list(result.node_commits.values()))
     assert final == result.node_commits["b"]
 
     # run branch 上看得到兩個節點的成果
@@ -505,3 +505,197 @@ def test_shared_mode_still_serialises(repo_and_workspace, tmp_path):
     assert result.status == PASSED, result.reason
     assert rec.has_phase("await_lock"), "共用模式必須維持序列化並提示等鎖"
     assert result.node_commits == {}, "共用模式不做自動 commit"
+
+# ------------------------------------------------ codex review 找到的問題
+
+
+def test_node_id_cannot_escape_the_worktree_root():
+    """節點 id 會被組成 worktree 路徑，而那個路徑底下有 rmtree。
+
+    工作流是從 POST /api/runs 進來的任意 JSON，若放行 "../../victim"，
+    create_node_workspace 會在 worktree_root 之外建目錄然後刪掉它。
+    """
+    from engine.graph import GraphError, Node
+
+    for bad in ["../escape", "a/b", "/abs/path", "..", ".", "-lead", "x" * 65, "a b"]:
+        with pytest.raises(GraphError, match="id"):
+            Node(id=bad, type="mock")
+
+    for good in ["req", "impl2", "qa-round.2", "a_b", "A1"]:
+        assert Node(id=good, type="mock").id == good
+
+
+def test_graph_parse_rejects_traversal_node_id():
+    from engine.graph import GraphError
+
+    with pytest.raises(GraphError, match="id 格式不合法"):
+        parse({"nodes": [{"id": "../../victim", "type": "mock",
+                          "config": {"prompt": "p"}}], "edges": []})
+
+
+def test_workspace_layer_also_refuses_to_escape(repo_and_base, tmp_path):
+    """第二道防線：底下有 rmtree，不能只靠 graph 那層驗證過。"""
+    from engine.workspace import WorkspaceError, create_node_workspace
+
+    repo, base = repo_and_base
+    victim = tmp_path / "wt" / "DO_NOT_DELETE"
+    victim.mkdir(parents=True)
+    (victim / "precious.txt").write_text("keep me\n")
+
+    with pytest.raises(WorkspaceError, match="逃出"):
+        create_node_workspace(
+            repo=repo, worktree_root=tmp_path / "wt", run_id="iso",
+            node_id="../DO_NOT_DELETE", base_commits=[base.base_sha],
+            run_base_sha=base.base_sha,
+        )
+    assert (victim / "precious.txt").exists(), "目標目錄被刪掉了"
+
+
+def test_condition_as_fan_in_keeps_both_branches(repo_and_base, tmp_path):
+    """條件節點若剛好是 fan-in 點，兩條分支的成果都要往下傳。
+
+    純資料節點不產生 commit，只帶第一個上游 commit 的話，另一條平行分支
+    成功完成的修改會靜默消失。
+    """
+    payload = {
+        "settings": {"isolation": PER_NODE},
+        "nodes": [
+            {"id": "req", "type": "requirement"},
+            mock_node("left", message="L", files={"left.txt": "L\n"}),
+            mock_node("right", message="R", files={"right.txt": "R\n"}),
+            {"id": "gate", "type": "condition", "config": {"expr": "True"}},
+            mock_node("after", message="下游"),
+        ],
+        "edges": [
+            {"from": "req", "to": "left"},
+            {"from": "req", "to": "right"},
+            {"from": "left", "to": "gate"},
+            {"from": "right", "to": "gate"},
+            {"from": "gate", "to": "after", "port": "true"},
+        ],
+    }
+    repo, base = repo_and_base
+    result, _, _, iso = run_per_node(payload, repo, base, tmp_path,
+                                     max_parallel_nodes=4)
+
+    assert result.status == PASSED, result.reason
+    after = iso.workspaces["after"].path
+    assert (after / "left.txt").exists(), "left 分支的成果被條件節點弄丟了"
+    assert (after / "right.txt").exists(), "right 分支的成果被條件節點弄丟了"
+
+
+def test_finalise_merges_all_terminal_branches(repo_and_base, tmp_path):
+    """圖可以 fan-out 成兩個各自結束的分支，run branch 要包含兩邊。
+
+    只挑「最後完成的 commit」會漏掉另一邊，而且挑到哪個還取決於執行時序。
+    """
+    payload = {
+        "settings": {"isolation": PER_NODE},
+        "nodes": [
+            {"id": "req", "type": "requirement"},
+            mock_node("endA", message="A", files={"end_a.txt": "A\n"}),
+            mock_node("endB", message="B", files={"end_b.txt": "B\n"}),
+        ],
+        "edges": [{"from": "req", "to": "endA"}, {"from": "req", "to": "endB"}],
+    }
+    repo, base = repo_and_base
+    result, _, _, iso = run_per_node(payload, repo, base, tmp_path,
+                                     max_parallel_nodes=4)
+    assert result.status == PASSED, result.reason
+
+    commits = [c for n, c in result.node_commits.items()
+               if result.node_status.get(n) == PASSED]
+    final = iso.finalise(base.branch, commits)
+    assert final
+
+    files = git(["ls-tree", "-r", "--name-only", base.branch], repo).splitlines()
+    assert "end_a.txt" in files, "終端分支 A 的成果沒進 run branch"
+    assert "end_b.txt" in files, "終端分支 B 的成果沒進 run branch"
+
+
+def test_finalise_single_tip_needs_no_merge(repo_and_base, tmp_path):
+    """線性圖只有一個 tip，直接指過去，不該多建整合 worktree。"""
+    payload = {
+        "settings": {"isolation": PER_NODE},
+        "nodes": [
+            mock_node("a", message="A", files={"a.txt": "1\n"}),
+            mock_node("b", message="B", files={"b.txt": "2\n"}),
+        ],
+        "edges": [{"from": "a", "to": "b"}],
+    }
+    repo, base = repo_and_base
+    result, _, _, iso = run_per_node(payload, repo, base, tmp_path)
+    assert result.status == PASSED, result.reason
+
+    final = iso.finalise(base.branch, list(result.node_commits.values()))
+    assert final == result.node_commits["b"], "b 包含 a，tip 只有 b"
+    assert iso.INTEGRATE not in iso.workspaces
+
+
+def test_finalise_conflict_raises(repo_and_base, tmp_path):
+    """兩個終端分支改同一處 → 整合失敗，呼叫端要能讓整個 run 失敗。"""
+    payload = {
+        "settings": {"isolation": PER_NODE},
+        "nodes": [
+            {"id": "req", "type": "requirement"},
+            mock_node("endA", message="A", files={"shared.txt": "A\n"}),
+            mock_node("endB", message="B", files={"shared.txt": "B\n"}),
+        ],
+        "edges": [{"from": "req", "to": "endA"}, {"from": "req", "to": "endB"}],
+    }
+    repo, base = repo_and_base
+    result, _, _, iso = run_per_node(payload, repo, base, tmp_path,
+                                     max_parallel_nodes=4)
+    assert result.status == PASSED, result.reason  # 兩個節點本身都成功
+
+    with pytest.raises(MergeConflict, match="shared.txt"):
+        iso.finalise(base.branch, list(result.node_commits.values()))
+
+
+def test_tip_commits_filters_ancestors(repo_and_base, tmp_path):
+    from engine.workspace import create_node_workspace, tip_commits
+
+    repo, base = repo_and_base
+    ws = create_node_workspace(repo, tmp_path / "wt", "iso", "chain",
+                               [base.base_sha], base.base_sha)
+    try:
+        (ws.path / "one.txt").write_text("1\n")
+        first_sha = ws.commit("one")
+        (ws.path / "two.txt").write_text("2\n")
+        second_sha = ws.commit("two")
+
+        # first 是 second 的祖先，只有 second 是 tip
+        assert tip_commits(repo, [first_sha, second_sha]) == [second_sha]
+        assert tip_commits(repo, [second_sha]) == [second_sha]
+        assert tip_commits(repo, []) == []
+    finally:
+        ws.remove()
+
+
+def test_condition_does_not_read_a_parallel_nodes_diff(repo_and_base, tmp_path):
+    """條件節點不能從共用 context 讀 diff。
+
+    共用狀態是 last-writer-wins：兩條平行分支同時完成時，條件節點可能拿到
+    另一條分支的 diff 而選錯出口。沒有工作目錄的節點應該從自己的上游 commit 算。
+    """
+    payload = {
+        "settings": {"isolation": PER_NODE},
+        "nodes": [
+            mock_node("impl", message="改了", files={"only_mine.txt": "x\n"}),
+            {"id": "gate", "type": "condition",
+             "config": {"expr": "'only_mine.txt' in changed_files"}},
+            mock_node("yes", message="走對了"),
+            mock_node("no", message="走錯了"),
+        ],
+        "edges": [
+            {"from": "impl", "to": "gate"},
+            {"from": "gate", "to": "yes", "port": "true"},
+            {"from": "gate", "to": "no", "port": "false"},
+        ],
+    }
+    repo, base = repo_and_base
+    result, _, _, _ = run_per_node(payload, repo, base, tmp_path)
+
+    assert result.status == PASSED, result.reason
+    assert result.node_status["yes"] == PASSED, "條件節點看不到自己上游的 diff"
+    assert result.node_status["no"] == R.SKIPPED

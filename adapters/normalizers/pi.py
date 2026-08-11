@@ -59,7 +59,28 @@ _WRITE_TOOLS = {"write", "edit", "multiedit", "patch"}
 _PATH_KEYS = ("absolutePath", "path", "file_path", "filePath")
 
 
+def make_normalizer():
+    """每次執行給一個新的翻譯器。
+
+    需要狀態是因為 tool_execution_end 只帶 {toolCallId, toolName, result, isError}
+    —— 沒有 args。要在「工具真的成功之後」才回報檔案改動，就得把 start 的參數
+    記下來等 end。狀態必須是每次執行獨立的：normalizer 模組層級的 dict 會讓
+    並行的節點互相污染。
+    """
+    pending_paths: dict[str, str] = {}
+
+    def normalize_stateful(raw: Any) -> list[dict[str, Any]]:
+        return _normalize(raw, pending_paths)
+
+    return normalize_stateful
+
+
 def normalize(raw: Any) -> list[dict[str, Any]]:
+    """無狀態入口，給不需要追蹤工具參數的呼叫端（例如測試單一事件）。"""
+    return _normalize(raw, {})
+
+
+def _normalize(raw: Any, pending_paths: dict[str, str]) -> list[dict[str, Any]]:
     if isinstance(raw, str):
         return [ev(STDOUT, raw)]
     if not isinstance(raw, dict):
@@ -90,28 +111,26 @@ def normalize(raw: Any) -> list[dict[str, Any]]:
     if etype == "tool_execution_start":
         name = raw.get("toolName") or "?"
         args = raw.get("args") or {}
-        out = [
+        call_id = str(raw.get("toolCallId") or "")
+        # 把寫檔工具的路徑記下來，等 end 確認成功了才回報改動。
+        # 不在這裡就發 file_edit —— NodeResult.files 是會被持久化的節點產出，
+        # 失敗的 write 不該讓它宣稱改過某個檔案。
+        if name in _WRITE_TOOLS and call_id:
+            path = _find_path(args)
+            if path:
+                pending_paths[call_id] = str(path)
+        return [
             ev(
                 TOOL_CALL,
                 _describe(name, args),
                 tool=name,
-                tool_use_id=raw.get("toolCallId"),
+                tool_use_id=call_id or None,
                 input=args,
             )
         ]
-        # file_edit 只能在這裡發：tool_execution_end 只帶
-        # {toolCallId, toolName, result, isError}，沒有 args，拿不到路徑。
-        # 代價是工具失敗時也會先報一筆改動，這點跟 claude 的 normalizer 一致，
-        # 而且「實際改了哪些檔案」的權威來源是每個節點跑完後重算的 git diff，
-        # 這個事件只負責 UI 時間軸的顯示。
-        if name in _WRITE_TOOLS:
-            path = _find_path(args)
-            if path:
-                out.append(ev(FILE_EDIT, str(path), paths=[str(path)], tool=name))
-        return out
 
     if etype == "tool_execution_end":
-        return _tool_end(raw)
+        return _tool_end(raw, pending_paths)
 
     if etype in ("compaction_start", "compaction_end"):
         # context 壓縮。會讓 token 統計看起來不連續，所以要留下痕跡。
@@ -189,32 +208,40 @@ def _message(message: dict) -> list[dict[str, Any]]:
 
 
 def _tool_result_message(message: dict) -> list[dict[str, Any]]:
-    """message_end 也會帶 toolResult 訊息；tool_execution_end 已經處理過內容，
-    這裡只補 isError 的情況，避免同一份輸出送兩次。"""
-    if not message.get("isError"):
-        return []
-    return [
-        ev(
-            ERROR,
-            _content_text(message.get("content")),
-            tool=message.get("toolName"),
-            tool_use_id=message.get("toolCallId"),
-        )
-    ]
+    """message_end 也會帶 toolResult 訊息，但 tool_execution_end 已經送過內容了，
+    所以這裡什麼都不發。
+
+    尤其**不能**在 isError 時發 ERROR 事件：工具失敗（bash 回非零、edit 找不到
+    要替換的文字）對 agent 來說是可恢復的，它會看到錯誤然後換個做法繼續，最後
+    正常結束並 exit 0。但 executor 的 _absorb 只要看到任何 ERROR 事件就會設定
+    result.error，於是 runner 會把一個其實成功的節點判成失敗。
+
+    節點該不該算失敗只看兩件事：CLI 的 exit code，以及 assistant 自己回報的
+    errorMessage（那才是真的走不下去）。
+    """
+    return []
 
 
-def _tool_end(raw: dict) -> list[dict[str, Any]]:
-    """tool_execution_end 只有 {toolCallId, toolName, result, isError} —— 沒有 args，
-    所以檔案改動不在這裡發（見 tool_execution_start）。"""
-    return [
+def _tool_end(raw: dict, pending_paths: dict[str, str]) -> list[dict[str, Any]]:
+    """tool_execution_end 沒有 args，路徑要從 start 記下來的對照表取。"""
+    name = raw.get("toolName") or "?"
+    call_id = str(raw.get("toolCallId") or "")
+    is_error = bool(raw.get("isError"))
+    path = pending_paths.pop(call_id, None)
+
+    out = [
         ev(
             TOOL_RESULT,
             _result_text(raw.get("result")),
-            tool=raw.get("toolName") or "?",
-            tool_use_id=raw.get("toolCallId"),
-            is_error=bool(raw.get("isError")),
+            tool=name,
+            tool_use_id=call_id or None,
+            is_error=is_error,
         )
     ]
+    # 只有成功的寫入才算檔案改動
+    if path and not is_error:
+        out.append(ev(FILE_EDIT, path, paths=[path], tool=name))
+    return out
 
 
 def _find_path(obj: dict) -> str | None:

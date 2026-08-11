@@ -29,8 +29,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+
+# 節點 id 會被用來組 worktree 路徑與 git branch 名稱，所以格式必須收緊。
+# 工作流是從 POST /api/runs 進來的任意 JSON —— 若放行 "../../something"，
+# create_node_workspace 會在 worktree_root 之外建目錄，然後 rmtree 掉它。
+NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # 內建節點型別（其餘的 type 必須對應一個 adapter id）
 REQUIREMENT = "requirement"
@@ -65,6 +71,13 @@ class Node:
     def __post_init__(self) -> None:
         if not self.id:
             raise GraphError("節點缺少 id")
+        if not NODE_ID_RE.match(self.id):
+            raise GraphError(
+                f"節點 id 格式不合法: {self.id!r}。"
+                "只允許英數字開頭，之後可用英數字、點、底線、減號，最長 64 字元。"
+                "（id 會用來組工作目錄路徑與 git branch 名稱，所以不能含路徑分隔符、"
+                "'..' 或其他特殊字元。）"
+            )
         if self.join not in ("all", "any"):
             raise GraphError(f"節點 {self.id}: join 只能是 all 或 any")
         if self.on_error not in ("fail", "continue"):

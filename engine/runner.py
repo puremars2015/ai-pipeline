@@ -36,7 +36,7 @@ from engine.context import ContextError, RunContext, evaluate, render_template
 from engine.events import ERROR, MESSAGE, STATUS, ev
 from engine.executor import Cancelled, NodeResult, execute
 from engine.isolation import PER_NODE, Isolation, PerNodeIsolation
-from engine.workspace import MergeConflict, Workspace
+from engine.workspace import MergeConflict, Workspace, diff_between
 from settings import Guards
 
 # emit(node_id, event_dict)
@@ -100,10 +100,17 @@ class Runner:
         self.arrived: dict[str, set[g.Edge]] = {nid: set() for nid in graph.nodes}
         self.visits: dict[str, int] = {nid: 0 for nid in graph.nodes}
         self.status: dict[str, str] = {nid: PENDING for nid in graph.nodes}
-        # per_node 模式：每個節點跑完留下的 commit，是下游節點的起始狀態
+        # per_node 模式的狀態傳遞。
+        # node_state 是「這個節點的輸出狀態由哪些 commit 組成」—— 刻意是 list 而
+        # 不是單一 commit：條件 / 需求節點自己不產生 commit，若它剛好是 fan-in
+        # 點（兩條平行分支都連進來），只記第一個 commit 會把另一條分支的成果
+        # 整個弄丟。它改成把所有上游都往下帶，由下一個真的有工作目錄的節點合併。
+        self.node_state: dict[str, list[str]] = {}
+        # 只記真的產生了 commit 的節點，給 RunResult 對外報告用
         self.output_commit: dict[str, str] = {}
         self.steps = 0
         self._commit_lock = threading.Lock()
+        self._ctx_lock = threading.Lock()
 
     # ------------------------------------------------------------ 事件
 
@@ -242,23 +249,35 @@ class Runner:
         回到最初的狀態重做一遍。
         """
         commits: list[str] = []
+
+        def add(values: list[str]) -> None:
+            for value in values:
+                if value and value not in commits:
+                    commits.append(value)
+
         with self._commit_lock:
-            own = self.output_commit.get(node_id)
-            if own:
-                commits.append(own)
+            add(self.node_state.get(node_id, []))
             for edge in self.graph.incoming(node_id):
-                upstream = self.output_commit.get(edge.src)
-                if upstream and upstream not in commits:
-                    commits.append(upstream)
+                add(self.node_state.get(edge.src, []))
+
         if not commits:
             commits.append(self.ctx.base_sha)
         return commits
 
     def _record_commit(self, node_id: str, commit: str) -> None:
+        """真的產生了 commit 的節點：它的輸出狀態就是那一個 commit。"""
         with self._commit_lock:
             self.output_commit[node_id] = commit
-        if isinstance(self.isolation, PerNodeIsolation):
-            self.isolation.record_commit(commit)
+            self.node_state[node_id] = [commit]
+
+    def passed_commits(self) -> list[str]:
+        """所有成功節點的產出 commit，給收尾時算 tip 用。"""
+        with self._commit_lock:
+            return [
+                commit
+                for node_id, commit in self.output_commit.items()
+                if self.status.get(node_id) == PASSED
+            ]
 
     def _acquire(self, node_id: str) -> Workspace | None:
         """取得節點的工作目錄。純資料節點不需要。"""
@@ -269,20 +288,40 @@ class Runner:
             return None
         return self.isolation.acquire(node_id, self._base_commits(node_id))
 
+    def _diff_for(
+        self, node_id: str, workspace: Workspace | None
+    ) -> tuple[str, list[str]]:
+        """算出這個節點看到的 diff。永遠回傳實際值，不從共用 context 讀。
+
+        沒有工作目錄的節點（per_node 模式下的條件 / 需求節點）改用 commit 之間
+        的 diff 算 —— 不需要 worktree。若它的上游狀態是多個還沒合併的 commit
+        （它自己就是 fan-in 點），無法用單一 diff 表達，就回空的，由下一個有
+        工作目錄的節點合併後再算。
+        """
+        if workspace is not None:
+            return workspace.diff(), workspace.changed_files()
+
+        if not self.per_node:
+            return "", []
+
+        bases = self._base_commits(node_id)
+        if len(bases) != 1 or bases[0] == self.ctx.base_sha:
+            return "", []
+        return diff_between(Path(self.ctx.repo), self.ctx.base_sha, bases[0])
+
     def _node_vars(
         self, node_id: str, workspace: Workspace | None
     ) -> dict[str, Any]:
         """組出這個節點看到的變數。
 
         造訪次數、diff、工作目錄都是「這個節點的」，用參數傳進 as_variables，
-        不寫回共用的 context —— 節點是並行跑的，寫回去會互相蓋掉。
+        絕不從共用的 context 讀 —— 節點是並行跑的，共用狀態是 last-writer-wins，
+        條件節點可能因此讀到另一條平行分支的 diff 而選錯出口。
         """
-        diff = None
-        changed: list[str] | None = None
-        if workspace is not None:
-            diff = workspace.diff()
-            changed = workspace.changed_files()
-            # 同時更新 context 當作 run 的摘要（最後寫的贏，只用於紀錄與 UI）
+        diff, changed = self._diff_for(node_id, workspace)
+
+        # context 只當 run 的摘要（UI 與紀錄用），兩個欄位一起更新保持一致
+        with self._ctx_lock:
             self.ctx.diff = diff
             self.ctx.changed_files = changed
 
@@ -378,12 +417,16 @@ class Runner:
 
         少了這一步，per_node 模式下條件節點會把整條鏈的狀態斷掉 —— 下游節點
         會從 run 的起始狀態重新開始，前面做的都不見了。
+
+        帶的是**所有**上游 commit 而不是第一個：條件節點可能自己就是 fan-in 點，
+        只留一個會把另一條平行分支的成果整個弄丟。真正的合併留給下一個有工作
+        目錄的節點做。
         """
         if not self.per_node:
             return
         bases = self._base_commits(node_id)
         with self._commit_lock:
-            self.output_commit[node_id] = bases[0]
+            self.node_state[node_id] = bases
 
     def _run_git(self, node: g.Node, out, workspace: Workspace | None) -> str:
         if workspace is None:
@@ -409,13 +452,14 @@ class Runner:
                 ev(STATUS, out.last_message, phase="git_commit", sha=sha),
             )
         elif action == "diff":
-            self._refresh_diff(workspace)
-            out.last_message = self.ctx.diff
+            # 用回傳值，不要繞一圈從共用的 ctx 讀 —— 並行節點會互相覆寫
+            diff, changed = self._refresh_diff(workspace)
+            out.last_message = diff
             self._record_commit(node.id, workspace.head())
             self.emit(
                 node.id,
-                ev(STATUS, f"diff {len(self.ctx.changed_files)} 個檔案",
-                   phase="git_diff", files=self.ctx.changed_files),
+                ev(STATUS, f"diff {len(changed)} 個檔案",
+                   phase="git_diff", files=changed),
             )
         else:
             raise ValueError(f"git 節點不支援的 action: {action}")
@@ -567,11 +611,15 @@ class Runner:
             binary=binary,
         )
 
-    def _refresh_diff(self, workspace: Workspace) -> None:
-        """更新 context 裡的 diff，讓下游的 QA 節點看到真實的變更。
+    def _refresh_diff(self, workspace: Workspace) -> tuple[str, list[str]]:
+        """重算 diff 並回傳。呼叫端要用回傳值，不要再從 ctx 讀。
 
         diff 只放在記憶體與 db，絕不寫進 worktree —— 舊 bash 把 changes.diff
         commit 進 repo，導致下一輪的 diff 包含上一輪的 diff，內容平方成長。
         """
-        self.ctx.diff = workspace.diff()
-        self.ctx.changed_files = workspace.changed_files()
+        diff = workspace.diff()
+        changed = workspace.changed_files()
+        with self._ctx_lock:
+            self.ctx.diff = diff
+            self.ctx.changed_files = changed
+        return diff, changed
