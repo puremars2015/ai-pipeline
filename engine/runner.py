@@ -96,15 +96,12 @@ class Runner:
 
         # worktree 的寫入鎖：mutates 節點序列化，避免互相蓋檔
         self.write_lock = threading.Lock()
-        self._seq = 0
-        self._seq_lock = threading.Lock()
 
     # ------------------------------------------------------------ 事件
 
     def emit(self, node_id: str, event: dict[str, Any]) -> None:
-        with self._seq_lock:
-            self._seq += 1
-            event = {**event, "seq": self._seq}
+        """發事件給下游 sink。序號由 sink 指派 —— 服務層也會發自己的事件
+        （run_start / run_end），序號必須有單一來源才不會錯亂。"""
         self._emit(node_id, event)
 
     # ------------------------------------------------------------ 主迴圈

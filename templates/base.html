@@ -10,7 +10,11 @@
 <body class="bg-slate-900 text-slate-100">
   <header class="flex items-center gap-4 border-b border-slate-700 px-4 py-3">
     <h1 class="font-semibold">AI Workflow Builder</h1>
-    <span id="repo-status" class="text-sm text-slate-400">檢查中…</span>
+    <nav class="flex gap-3 text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-100">編輯器</a>
+      <a href="/runs" class="text-slate-400 hover:text-slate-100">執行紀錄</a>
+    </nav>
+    <span id="repo-status" class="ml-auto text-sm text-slate-400">檢查中…</span>
   </header>
 
   <main>{% block content %}

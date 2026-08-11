@@ -44,15 +44,20 @@ def mock_node(nid, label=None, **spec):
 
 
 class Recorder:
-    """收集事件，測試用。"""
+    """收集事件，測試用。
+
+    序號在這裡指派 —— 正式環境是 RunBus 負責，兩者都是「單一 sink 決定順序」。
+    """
 
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
         self.lock = threading.Lock()
+        self._seq = 0
 
     def __call__(self, node_id: str, event: dict) -> None:
         with self.lock:
-            self.events.append((node_id, event))
+            self._seq += 1
+            self.events.append((node_id, {**event, "seq": self._seq}))
 
     def phases(self, node_id: str) -> list[str]:
         return [

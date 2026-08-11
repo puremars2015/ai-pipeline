@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}執行紀錄{% endblock %}
+{% block content %}
+<div class="p-4">
+  <h2 class="mb-3 text-lg font-semibold">執行紀錄</h2>
+  <div id="runs" class="text-sm text-slate-400">載入中…</div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const BADGE = {
+  passed: 'bg-emerald-500/15 text-emerald-300',
+  failed: 'bg-rose-500/15 text-rose-300',
+  running: 'bg-sky-500/15 text-sky-300',
+  cancelled: 'bg-slate-500/15 text-slate-300',
+  queued: 'bg-amber-500/15 text-amber-300',
+};
+
+fetch('/api/runs').then(r => r.json()).then(({ runs }) => {
+  const host = document.getElementById('runs');
+  if (!runs.length) {
+    host.textContent = '還沒有任何執行紀錄。';
+    return;
+  }
+  host.innerHTML = runs.map(r => `
+    <a href="/runs/${r.id}" class="mb-2 block rounded border border-slate-700 p-3 hover:border-slate-500">
+      <div class="flex items-center gap-3">
+        <span class="rounded px-2 py-0.5 text-xs ${BADGE[r.status] || ''}">${r.status}</span>
+        <span class="font-mono text-xs text-slate-500">${r.id}</span>
+        <span class="text-slate-300">${r.workflow_name || ''}</span>
+      </div>
+      <div class="mt-1 truncate text-slate-400">${r.requirement || '(沒有需求文字)'}</div>
+      ${r.reason ? `<div class="mt-1 text-xs text-amber-400">${r.reason}</div>` : ''}
+    </a>`).join('');
+});
+</script>
+{% endblock %}
