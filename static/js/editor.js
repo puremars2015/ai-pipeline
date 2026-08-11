@@ -193,7 +193,14 @@ function nodeHtml(node) {
 function summarise(node) {
   const cfg = node.config || {};
   if (node.type === 'condition') return cfg.expr || '(沒有運算式)';
-  if (node.type === 'shell') return (cfg.command || '(沒有指令)').split('\n')[0].slice(0, 60);
+  if (node.type === 'shell') {
+    // 挑第一行「看得出在做什麼」的內容。多行腳本的第一行常常是 set -u 或註解，
+    // 拿那個當摘要等於什麼都沒說。
+    const line = (cfg.command || '').split('\n')
+      .map((l) => l.trim())
+      .find((l) => l && !l.startsWith('#') && !/^set\s/.test(l) && !/^[A-Z_]+=/.test(l));
+    return line ? line.slice(0, 60) : '(沒有指令)';
+  }
   if (node.type === 'git') return `${cfg.action || 'commit'}: ${cfg.message || ''}`.slice(0, 60);
   if (node.type === 'requirement') return cfg.text ? cfg.text.slice(0, 60) : '(用啟動時輸入的需求)';
   const prompt = (cfg.prompt || '').trim();
