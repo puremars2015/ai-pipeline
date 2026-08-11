@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 執行產物
+logs/
+runs/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# 本機設定（config.yaml 是範本，config.local.yaml 才是實際值）
+config.local.yaml
+
+# OS
+.DS_Store
