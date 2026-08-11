@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AI Workflow Builder{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  {% block head %}{% endblock %}
+</head>
+<body class="bg-slate-900 text-slate-100">
+  <header class="flex items-center gap-4 border-b border-slate-700 px-4 py-3">
+    <h1 class="font-semibold">AI Workflow Builder</h1>
+    <span id="repo-status" class="text-sm text-slate-400">檢查中…</span>
+  </header>
+
+  <main>{% block content %}
+    <p class="p-4 text-slate-400">編輯器在 P4 實作。</p>
+  {% endblock %}</main>
+
+  <script>
+    fetch('/api/health').then(r => r.json()).then(d => {
+      const el = document.getElementById('repo-status');
+      el.textContent = d.project_repo.ok
+        ? `目標 repo: ${d.project_repo.path} (${d.main_branch})`
+        : `⚠ ${d.project_repo.error.split('\n')[0]}`;
+      el.className = d.project_repo.ok
+        ? 'text-sm text-emerald-400'
+        : 'text-sm text-amber-400';
+    });
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,39 @@
+# ============================================================
+# AI Workflow Builder 設定
+# 複製成 config.local.yaml 改實際值（config.local.yaml 不進 git）
+# ============================================================
+
+# 要讓 agent 動手改程式碼的目標 repo。
+# 安全限制：不可以是 $HOME，也不可以是本工具自己的目錄。
+project_repo: "~/Documents/my-project"
+
+# worktree 基準分支（每次 run 從 origin/<這個> 開新 branch）
+main_branch: "main"
+
+# 每個 run 的 worktree 放哪
+worktree_root: "~/ai-pipeline-worktrees"
+
+# run 產物（plan.md / qa-report.md / diff 等）放哪。
+# 刻意放在目標 repo 之外，避免這些檔案被 merge 進 main。
+runs_dir: "./runs"
+
+# sqlite 位置
+database: "./ai-pipeline.sqlite"
+
+# ---- 執行防護 ----
+guards:
+  # 同一個 run 內最多幾個節點同時跑（mutates 節點仍受 worktree 寫入鎖序列化）
+  max_parallel_nodes: 4
+  # 單一節點在一次 run 中最多被造訪幾次（迴圈保護）
+  default_max_visits: 3
+  # 整個 run 的節點執行總次數上限（全域迴圈保護）
+  max_run_steps: 60
+  # 單一節點預設 timeout（秒）
+  default_node_timeout: 1800
+  # 整個 run 的 timeout（秒）
+  run_timeout: 7200
+  # terminate 後等幾秒才 kill
+  kill_grace_seconds: 10
+
+# 執行完成後是否自動清掉 worktree（false 方便你進去看現場）
+cleanup_worktree_on_success: false
