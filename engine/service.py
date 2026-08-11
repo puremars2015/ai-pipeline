@@ -168,6 +168,7 @@ class RunService:
                 base_sha=workspace.base_sha,
                 workdir=str(workspace.path),
                 tool_root=str(ROOT),
+                repo=str(workspace.repo),
             )
 
             runner = Runner(

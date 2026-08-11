@@ -35,8 +35,8 @@
       "label": "Claude Code 實作",
       "max_visits": 3,
       "config": {
-        "permission_mode": "acceptEdits",
-        "prompt": "依照以下計畫實作。這是第 {{ loop.iteration }} 輪。\n\n== 計畫 ==\n{{ nodes.plan.last_message }}\n\n{% if nodes.qa.structured %}== 上一輪 QA 發現的問題（必須逐項修掉）==\n{% for issue in nodes.qa.structured.issues %}- {{ issue }}\n{% endfor %}\n{{ nodes.qa.structured.summary }}\n{% endif %}{% if nodes.tests.exit_code and nodes.tests.exit_code != 0 %}== 測試失敗輸出 ==\n{{ nodes.tests.stdout }}\n{% endif %}\n完成後簡短說明你做了什麼、跟計畫有沒有出入、為什麼。"
+        "permission_mode": "bypassPermissions",
+        "prompt": "依照以下計畫實作。這是第 {{ loop.iteration }} 輪。\n\n== 計畫 ==\n{{ nodes.plan.last_message }}\n\n{% if nodes.qa.structured %}== 上一輪 QA 發現的問題（必須逐項修掉）==\n{% for issue in nodes.qa.structured.issues %}- {{ issue }}\n{% endfor %}\n{{ nodes.qa.structured.summary }}\n{% endif %}{% if nodes.tests.exit_code and nodes.tests.exit_code != 0 %}== 測試失敗輸出 ==\n{{ nodes.tests.stdout }}\n{% endif %}\n你可以直接執行指令（跑測試、檢查結果）。\n不要新增與需求無關的檔案 —— 特別是不要寫「驗證報告」、「總結」之類的\n說明文件來取代真的執行測試；QA 看的是 diff 與實際測試結果。\n\n完成後簡短說明你做了什麼、跟計畫有沒有出入、為什麼。"
       },
       "pos": {
         "x": 540,
@@ -63,7 +63,7 @@
       "on_error": "continue",
       "mutates": false,
       "config": {
-        "command": "if [ -f pytest.ini ] || [ -d tests ]; then python -m pytest -q; elif [ -f package.json ]; then npm test --silent; else echo '沒有偵測到測試設定，跳過'; fi",
+        "command": "set -u\nREPO=\"{{ run.repo }}\"\nPY=\"\"\n# 1) worktree 自己有（少數 repo 會 commit venv）\nfor c in .venv/bin/python venv/bin/python; do [ -x \"$c\" ] && PY=\"$c\" && break; done\n# 2) 借主 repo 的 —— worktree 是乾淨 checkout，不會有 gitignore 掉的 venv\nif [ -z \"$PY\" ]; then\n  for c in \"$REPO/.venv/bin/python\" \"$REPO/venv/bin/python\"; do [ -x \"$c\" ] && PY=\"$c\" && break; done\nfi\n# 3) uv 管理的專案\nif [ -z \"$PY\" ] && command -v uv >/dev/null 2>&1 && [ -f pyproject.toml ]; then PY=\"uv run python\"; fi\n\nif [ -n \"$PY\" ] && $PY -c \"import pytest\" >/dev/null 2>&1; then\n  echo \"使用 $PY 執行 pytest\"\n  PYTHONPATH=\"$PWD${PYTHONPATH:+:$PYTHONPATH}\" $PY -m pytest -q\n  exit $?\nfi\n\nif [ -f package.json ] && grep -q '\"test\"' package.json; then\n  npm test --silent\n  exit $?\nfi\n\necho \"SKIPPED: 找不到可用的測試環境（worktree 與主 repo $REPO 都沒有裝了 pytest 的 venv，也沒有 npm test）。\"\necho \"這不等於測試通過 —— 下游 QA 只能依 diff 判斷。\"\nexit 0",
         "expect_exit_code": 0
       },
       "pos": {

@@ -328,11 +328,24 @@ class Runner:
         normalizer = self.registry.normalizer(spec)
         mutates = spec.mutates if node.mutates is None else node.mutates
 
-        variables = {**spec.defaults(), **node.config, **self.ctx.as_variables()}
+        ctx_vars = self.ctx.as_variables()
+
+        # 節點設定裡的字串本身也可以是模板（shell 的 command、git 的 message…），
+        # 必須先渲染過再交給 adapter 組參數。adapter 的參數替換只有單層，
+        # 直接把原始設定值塞進 argv 的話，值裡面的 {{ … }} 會原封不動被當成
+        # 字面字串傳給 CLI —— 實測時 shell 節點就印出了字面的 "{{ run.repo }}"。
+        rendered_config: dict[str, Any] = {}
+        for key, value in node.config.items():
+            if key == "schema" or not isinstance(value, str):
+                rendered_config[key] = value  # schema 是 JSON，不當模板處理
+            else:
+                rendered_config[key] = render_template(value, ctx_vars)
+
+        variables = {**spec.defaults(), **rendered_config, **ctx_vars}
         variables["workdir"] = self.ctx.workdir
         variables["tool_root"] = self.ctx.tool_root
 
-        prompt = render_template(node.config.get("prompt") or "", variables)
+        prompt = rendered_config.get("prompt") or ""
         variables["prompt"] = prompt
 
         # 續接同一個節點的前一次 session（迴圈第二輪起）
@@ -378,7 +391,7 @@ class Runner:
         out.stdout = result.stdout
         out.usage = result.usage
 
-        expected = node.config.get("expect_exit_code")
+        expected = rendered_config.get("expect_exit_code")
         expected = 0 if expected in (None, "") else int(expected)
         failed = result.exit_code != expected or bool(result.error)
 

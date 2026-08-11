@@ -146,6 +146,69 @@ def test_requirement_flows_into_prompt(registry, tmp_path):
     assert ctx.requirement == "測試需求"
 
 
+def test_shell_command_is_template_rendered(registry, tmp_path):
+    """shell 節點的 command 本身要能用模板。
+
+    adapter 的參數替換只有單層：直接把設定值塞進 argv，值裡面的 {{ … }} 會
+    原樣傳給 CLI。實測時 tests 節點就把字面的 "{{ run.repo }}" 印了出來，
+    導致找不到測試環境，QA 因此連續三輪判 FAIL。
+    """
+    marker = tmp_path / "rendered.txt"
+    payload = {
+        "nodes": [
+            {"id": "req", "type": "requirement"},
+            {
+                "id": "sh",
+                "type": "shell",
+                "mutates": False,
+                "config": {
+                    # 同時驗證 run.* 與 requirement 都進得去
+                    "command": f'echo "repo={{{{ run.repo }}}} need={{{{ requirement }}}}" > {marker}',
+                    "expect_exit_code": 0,
+                },
+            },
+        ],
+        "edges": [{"from": "req", "to": "sh"}],
+    }
+    run, ctx, _ = build(payload, registry, tmp_path)
+    ctx.repo = "/some/target/repo"
+    result = run.run()
+
+    assert result.status == PASSED, result.reason
+    written = marker.read_text("utf-8")
+    assert "{{" not in written, f"模板沒有被渲染: {written}"
+    assert "repo=/some/target/repo" in written
+    assert "need=測試需求" in written
+
+
+def test_git_commit_message_is_template_rendered(tmp_path):
+    from engine.workspace import create_workspace
+
+    repo = make_repo(tmp_path / "proj")
+    ws = create_workspace(
+        project_repo=repo, worktree_root=tmp_path / "wt", main_branch="main",
+        run_id="msg", tool_root=tmp_path / "tool",
+    )
+    try:
+        payload = {
+            "nodes": [
+                mock_node("impl", message="x", files={"a.txt": "1\n"}),
+                {"id": "c", "type": "git",
+                 "config": {"action": "commit", "message": "impl [{{ run.id }}]"}},
+            ],
+            "edges": [{"from": "impl", "to": "c"}],
+        }
+        run, _, _ = build(payload, Registry(), tmp_path, workspace=ws)
+        assert run.run().status == PASSED
+
+        import subprocess
+        log = subprocess.run(["git", "log", "-1", "--pretty=%s"], cwd=ws.path,
+                             capture_output=True, text=True).stdout
+        assert log.strip() == "impl [test-run]"
+    finally:
+        ws.remove()
+
+
 def test_upstream_output_reaches_downstream_prompt(registry, tmp_path):
     payload = {
         "nodes": [

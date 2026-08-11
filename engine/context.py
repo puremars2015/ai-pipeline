@@ -96,6 +96,10 @@ class RunContext:
     base_sha: str = ""
     workdir: str = ""
     tool_root: str = ""
+    # 目標 repo 的根目錄。worktree 裡沒有 .venv / node_modules（那些都被
+    # gitignore 掉，git worktree 不會帶過去），所以跑測試的節點需要知道
+    # 主 repo 在哪，才能借用它已經裝好的環境。
+    repo: str = ""
     diff: str = ""
     changed_files: list[str] = field(default_factory=list)
     nodes: dict[str, NodeOutput] = field(default_factory=dict)
@@ -115,6 +119,8 @@ class RunContext:
                     "base_sha": self.base_sha,
                     "diff": self.diff,
                     "changed_files": self.changed_files,
+                    "workdir": self.workdir,
+                    "repo": self.repo,
                 }
             ),
             "nodes": wrap({k: v.as_dict() for k, v in self.nodes.items()}),
