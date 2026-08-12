@@ -292,3 +292,77 @@ def test_review_template_runs_with_mocks(scratch, tmp_path):
     assert ctx.nodes["review"].structured["verdict"] == "PASS"
     assert result.node_status["report"] == PASSED
     assert result.node_status["fix"] == "skipped"
+
+
+# ------------------------------------- sample-project-notes（需求已填好）
+
+SAMPLE_TEMPLATE = ROOT / "workflows" / "sample-project-notes.json"
+
+
+def test_sample_template_is_valid_and_selfcontained():
+    """這個範本的重點是「不用輸入任何東西就能跑」。"""
+    payload = json.loads(SAMPLE_TEMPLATE.read_text("utf-8"))
+    graph = parse(payload)
+    assert validate(graph, [s.id for s in Registry().all()]) == []
+
+    # 需求必須是預先填好的
+    text = graph.nodes["req"].config.get("text") or ""
+    assert len(text) > 100, "需求沒有填好，就不算「已填好的版本」"
+    assert "PROJECT_NOTES.md" in text
+
+    # 只用 codex：使用者的 Claude 額度可能是空的，範本不該因此跑不動
+    agents = {n.type for n in graph.nodes.values()
+              if not n.is_builtin and n.type != "shell"}
+    assert agents == {"codex"}, f"範本應該只依賴 codex，實際用了 {agents}"
+
+    # 有重試迴圈
+    assert {(e.src, e.port, e.dst) for e in graph.back_edges()} == {
+        ("gate", "false", "write")
+    }
+    assert parse(to_dict(graph)) is not None
+
+
+def test_sample_template_requirement_overrides_run_input(tmp_path):
+    """需求節點填了 text，就該用它，不管啟動 run 時輸入什麼（包含空字串）。"""
+    from engine.workspace import create_workspace
+
+    repo = make_repo(tmp_path / "proj")
+    ws = create_workspace(project_repo=repo, worktree_root=tmp_path / "wt",
+                          main_branch="main", run_id="sample",
+                          tool_root=tmp_path / "tool")
+    try:
+        payload = json.loads(SAMPLE_TEMPLATE.read_text("utf-8"))
+        filled = payload["nodes"][0]["config"]["text"]
+
+        # 把 agent 換成 mock，只驗證需求的傳遞
+        for node in payload["nodes"]:
+            if node["type"] == "codex":
+                node["type"] = "mock"
+                node["config"]["script"] = script(
+                    message="ok",
+                    files={"PROJECT_NOTES.md": "# x\n做什麼\n進入點\n怎麼跑\n該先看\n" * 3},
+                    structured={"verdict": "PASS", "issues": [], "summary": "ok"},
+                )
+            if node["id"] == "check":
+                node["config"]["command"] = "test -f PROJECT_NOTES.md"
+            if node["id"] == "done":
+                node["config"]["command"] = "echo done"
+
+        # 啟動時故意不給需求
+        result, ctx, _ = run_template(payload, ws, tmp_path, requirement="")
+        assert result.status == PASSED, result.reason
+        assert ctx.requirement == filled, "需求節點的 text 沒有生效"
+        assert ctx.nodes["req"].last_message == filled
+    finally:
+        ws.remove()
+
+
+def test_sample_template_mechanical_check_catches_extra_files():
+    """機械檢查要能抓到「動了不該動的檔案」—— 這是 QA 之外的第一道關卡。"""
+    graph = parse(json.loads(SAMPLE_TEMPLATE.read_text("utf-8")))
+    command = graph.nodes["check"].config["command"]
+    assert "git diff --name-only" in command
+    assert "PROJECT_NOTES.md" in command
+    # 檢查節點失敗不該直接中止 run —— 那是要交給條件節點判斷的訊號
+    assert graph.nodes["check"].on_error == "continue"
+    assert graph.nodes["check"].mutates is False

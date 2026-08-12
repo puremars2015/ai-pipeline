@@ -185,8 +185,29 @@ curl -X POST localhost:5111/api/workflows -H 'Content-Type: application/json' -d
 
 | 範本 | 做什麼 |
 |---|---|
+| `sample-project-notes` | **第一次試跑用這個。需求已經填好**，設定好 `project_repo` 直接按執行 |
 | `plan-impl-qa` | 需求 → Codex 規劃 → Claude 實作 → 測試 → Codex QA，沒過就打回去修 |
 | `codex-review` | 把目前 branch 對齊進 worktree → Codex 對照 main 審查 → 有問題就讓 Claude 修 → 再審 |
+
+### `sample-project-notes`（需求已填好）
+
+要它讀你的 repo，然後產生一份 `PROJECT_NOTES.md`（新人五分鐘速覽）。挑這個當
+第一次試跑是因為：任何 repo 都適用、以讀為主只新增一個檔案、只用 codex
+（不需要 Claude 額度）、跑完你手上的東西完全沒被動到。
+
+需求裡有一條硬性要求是「不確定的就寫『未確認』，不要猜」，所以它同時示範了
+QA 的價值。實跑在一個只有 `calc.py` 的 repo 上，它的產出是：
+
+```
+## 3. 怎麼跑起來
+正式啟動或測試指令：**未確認**。
+目前 repo 沒有 README、pyproject.toml、package.json、Makefile … 可用來確認
+專案支援的指令。tests/test_calc.py 的寫法雖與 pytest 相容，但 repo 沒有宣告
+pytest 依賴或記載 pytest 指令，因此不將其列為正式支援的指令。
+```
+
+一次完整 run 約 4 分鐘、38 萬 tokens（explore / write / qa 三個節點）。
+內容豐富的 repo 產出會實用得多。
 
 `codex-review` 的第一個節點會 `git reset --hard` 到目標 branch，所以之後
 `{{ run.diff }}` 剛好是「這條 branch 相對 main 的完整變更」，修正也 commit 在

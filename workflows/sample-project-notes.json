@@ -1,0 +1,107 @@
+{
+  "id": "sample-project-notes",
+  "name": "【範例，需求已填好】產生專案速覽筆記",
+  "settings": {
+    "isolation": "shared",
+    "max_run_steps": 30,
+    "description": "第一次試跑用的範例：需求已經填好，設定好 project_repo 之後直接按執行就會動。任何 repo 都適用，唯讀為主、只新增一個檔案，便宜也安全。全部用 codex（不需要 Claude 額度）。"
+  },
+  "nodes": [
+    {
+      "id": "req",
+      "type": "requirement",
+      "label": "需求（已填好）",
+      "pos": { "x": 40, "y": 90 },
+      "config": {
+        "text": "在專案根目錄建立 PROJECT_NOTES.md，用中文寫一份「新人五分鐘速覽」，包含四個小節：\n\n1. 這個專案在做什麼（2-3 句）\n2. 進入點在哪（實際的檔案路徑）\n3. 怎麼跑起來（實際可執行的指令）\n4. 讀程式碼時最該先看的 3 個檔案，各附一句話說明\n\n硬性要求：\n- 每一項都必須從實際的程式碼、設定檔或既有文件判斷得出來，不可以臆測。\n- 提到的檔案路徑必須真的存在。\n- 提到的指令必須是這個 repo 真的支援的（從 package.json / pyproject.toml / Makefile / README 找）。\n- 不確定的就寫「未確認」，不要猜。\n- 只新增 PROJECT_NOTES.md 這一個檔案，不要改動任何既有檔案。"
+      }
+    },
+    {
+      "id": "explore",
+      "type": "codex",
+      "label": "探索專案",
+      "mutates": false,
+      "pos": { "x": 290, "y": 90 },
+      "config": {
+        "sandbox": "read-only",
+        "prompt": "先摸清楚這個專案，為接下來要寫的速覽筆記蒐集事實。\n\n== 要寫的東西 ==\n{{ requirement }}\n\n請實際去讀檔案（列目錄、看設定檔、看進入點），把你**確認過**的事實整理出來：\n\n- 專案的用途與技術棧（依據是哪些檔案）\n- 進入點的實際路徑\n- 可執行的指令，以及你是從哪個檔案看到的\n- 最值得先讀的 3 個檔案與理由\n- 有哪些你查不到、只能標「未確認」的\n\n只輸出整理好的事實，不要寫 PROJECT_NOTES.md，也不要動任何檔案。\n每一條都要註明依據（來自哪個檔案）。"
+      }
+    },
+    {
+      "id": "write",
+      "type": "codex",
+      "label": "撰寫筆記",
+      "max_visits": 3,
+      "pos": { "x": 540, "y": 90 },
+      "config": {
+        "sandbox": "workspace-write",
+        "prompt": "依照下面蒐集到的事實，建立 PROJECT_NOTES.md。這是第 {{ loop.iteration }} 輪。\n\n== 需求 ==\n{{ requirement }}\n\n== 上一步確認過的事實 ==\n{{ nodes.explore.last_message }}\n\n{% if nodes.qa.structured %}== 上一輪審查發現的問題（必須逐項修掉）==\n{% for issue in nodes.qa.structured.issues %}- {{ issue }}\n{% endfor %}\n{{ nodes.qa.structured.summary }}\n\n{% endif %}只建立 PROJECT_NOTES.md 這一個檔案。不要改動既有檔案，也不要另外寫「說明」或「報告」之類的檔案。\n\n寫完簡短說一下你寫了什麼、有哪幾項標成「未確認」以及為什麼。"
+      }
+    },
+    {
+      "id": "commit",
+      "type": "git",
+      "label": "Commit",
+      "pos": { "x": 790, "y": 90 },
+      "config": {
+        "action": "commit",
+        "message": "docs: 產生 PROJECT_NOTES.md（第 {{ loop.iteration }} 輪）[{{ run.id }}]"
+      }
+    },
+    {
+      "id": "check",
+      "type": "shell",
+      "label": "機械檢查",
+      "mutates": false,
+      "on_error": "continue",
+      "pos": { "x": 40, "y": 330 },
+      "config": {
+        "command": "set -u\nFAIL=0\n\nif [ ! -f PROJECT_NOTES.md ]; then\n  echo 'FAIL: PROJECT_NOTES.md 不存在'\n  exit 1\nfi\n\nLINES=\"$(wc -l < PROJECT_NOTES.md | tr -d ' ')\"\necho \"PROJECT_NOTES.md 共 ${LINES} 行\"\nif [ \"${LINES}\" -lt 8 ]; then\n  echo 'FAIL: 內容太短，四個小節不可能都寫到'\n  FAIL=1\nfi\n\nfor SECTION in '做什麼' '進入點' '怎麼跑' '該先看'; do\n  if ! grep -q \"${SECTION}\" PROJECT_NOTES.md; then\n    echo \"FAIL: 找不到「${SECTION}」相關的小節\"\n    FAIL=1\n  fi\ndone\n\n# 只能新增這一個檔案\nOTHERS=\"$(git diff --name-only \"{{ run.base_sha }}\" | grep -v '^PROJECT_NOTES.md$' || true)\"\nif [ -n \"${OTHERS}\" ]; then\n  echo 'FAIL: 動到了不該動的檔案：'\n  echo \"${OTHERS}\" | sed 's/^/  /'\n  FAIL=1\nfi\n\n# 文件裡提到的檔案路徑是否真的存在（挑出反引號包起來、看起來像路徑的）\necho\necho '--- 檢查提到的路徑 ---'\ngrep -oE '`[^`]+`' PROJECT_NOTES.md | tr -d '`' | grep -E '^[A-Za-z0-9_./-]+\\.[A-Za-z0-9]+$' | sort -u | while read -r P; do\n  if [ -e \"${P}\" ]; then echo \"  ok   ${P}\"; else echo \"   !!  ${P} 不存在\"; fi\ndone\n\necho\n[ \"${FAIL}\" = \"0\" ] && echo '機械檢查通過' || echo '機械檢查有問題'\nexit \"${FAIL}\"",
+        "expect_exit_code": 0
+      }
+    },
+    {
+      "id": "qa",
+      "type": "codex",
+      "label": "Codex 審查",
+      "mutates": false,
+      "max_visits": 3,
+      "pos": { "x": 290, "y": 330 },
+      "config": {
+        "sandbox": "read-only",
+        "schema": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"PASS\",\"FAIL\"]},\"issues\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"summary\":{\"type\":\"string\"}},\"required\":[\"verdict\",\"issues\",\"summary\"],\"additionalProperties\":false}",
+        "prompt": "檢查產出的 PROJECT_NOTES.md 是不是真的符合需求，而且內容**與實際的程式碼相符**。\n\n== 需求 ==\n{{ requirement }}\n\n== 實際的 diff ==\n{{ run.diff[:60000] }}\n\n== 機械檢查結果（exit {{ nodes.check.exit_code }}）==\n{{ nodes.check.stdout }}\n\n請你自己去讀 repo 裡的檔案來對照（sandbox 是唯讀），逐項確認：\n1. 四個小節都有\n2. 提到的檔案路徑真的存在\n3. 提到的指令這個 repo 真的支援\n4. 對專案用途的描述與程式碼相符，沒有臆測當成事實\n5. 只新增了 PROJECT_NOTES.md，沒動到別的檔案\n\n你看的是 diff 與實際檔案，不是撰寫者的自述 —— 不要採信任何「我已經確認過」的說法。\n寫得保守（標「未確認」）不算錯，把不確定的事寫成肯定句才算錯。\n\n以 JSON 回覆；issues 列出每一個必須修的問題。"
+      }
+    },
+    {
+      "id": "gate",
+      "type": "condition",
+      "label": "通過？",
+      "pos": { "x": 540, "y": 330 },
+      "config": {
+        "expr": "nodes.qa.structured.verdict == 'PASS' and nodes.check.exit_code == 0"
+      }
+    },
+    {
+      "id": "done",
+      "type": "shell",
+      "label": "完成",
+      "mutates": false,
+      "pos": { "x": 790, "y": 330 },
+      "config": {
+        "command": "set -u\nBASE=\"{{ run.base_sha }}\"\necho '=== 產出的 PROJECT_NOTES.md ==='\ncat PROJECT_NOTES.md\necho\necho '=== 本次的 commit ==='\ngit --no-pager log --oneline \"${BASE}\"..HEAD\necho\necho \"想留下來的話：git merge --no-ff {{ run.branch }}\"\necho '不想留就什麼都不用做，這條 branch 丟著即可。'",
+        "expect_exit_code": 0
+      }
+    }
+  ],
+  "edges": [
+    { "from": "req", "to": "explore" },
+    { "from": "explore", "to": "write" },
+    { "from": "write", "to": "commit" },
+    { "from": "commit", "to": "check" },
+    { "from": "check", "to": "qa" },
+    { "from": "qa", "to": "gate" },
+    { "from": "gate", "to": "done", "port": "true" },
+    { "from": "gate", "to": "write", "port": "false" }
+  ]
+}
