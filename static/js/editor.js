@@ -18,6 +18,9 @@ const state = {
   settings: {},
 };
 
+// 隨附的範本：覆蓋它們是不可逆的，儲存前要多問一次
+const SHIPPED = new Set(['plan-impl-qa', 'codex-review']);
+
 const KIND_LABEL = { builtin: '內建', agent: 'Agent', shell: '指令', mock: '測試' };
 
 // ------------------------------------------------------------------ 啟動
@@ -404,8 +407,14 @@ async function loadWorkflow(id) {
   validate();
 }
 
-async function save() {
+async function save({ asNew = false } = {}) {
   const graph = currentGraph();
+
+  // 另存新檔就把 id 拿掉 —— 後端看到沒有 id 才會配一個新的。
+  // 沒有這個區分的話，按儲存永遠是覆蓋目前開著的那個（包括隨附的範本），
+  // 而且範本被蓋掉之後不會自動還原（seeder 只在 db 裡沒有該 id 時才匯入）。
+  if (asNew) delete graph.id;
+
   const resp = await fetch('/api/workflows', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -413,11 +422,44 @@ async function save() {
   });
   const body = await resp.json();
   if (!resp.ok) { status(body.error, 'bad'); return; }
+
   state.workflowId = body.id;
   await loadWorkflowList();
   $('#wf-list').value = body.id;
-  status(body.problems.length ? `已存，但有 ${body.problems.length} 個問題` : '已儲存', body.problems.length ? 'warn' : 'ok');
+  const what = asNew ? '已另存為新的工作流' : '已儲存';
+  status(body.problems.length ? `${what}，但有 ${body.problems.length} 個問題` : what,
+         body.problems.length ? 'warn' : 'ok');
   showProblems(body.problems);
+}
+
+/** 清空畫布，開一個新的工作流。 */
+function newWorkflow() {
+  state.workflowId = '';
+  state.workflowName = '新工作流';
+  state.settings = {};
+  state.editor.clear();
+  $('#wf-name').value = state.workflowName;
+  $('#wf-list').value = '';
+  $('#wf-isolation').value = 'shared';
+  selectNode(null);
+  updateIsolationHint();
+  showProblems(['空的工作流：從左邊拖一個「需求」節點開始。']);
+  status('新的工作流（還沒儲存）', 'warn');
+}
+
+async function deleteWorkflow() {
+  if (!state.workflowId) { status('這個工作流還沒儲存過', 'warn'); return; }
+  const name = $('#wf-name').value || state.workflowId;
+  if (!confirm(`確定要刪除「${name}」？\n\n（隨附的範本刪掉之後，下次啟動服務會從 workflows/ 目錄重新匯入。）`)) return;
+
+  const resp = await fetch(`/api/workflows/${encodeURIComponent(state.workflowId)}`,
+                           { method: 'DELETE' });
+  if (!resp.ok) { status('刪除失敗', 'bad'); return; }
+  await loadWorkflowList();
+  const first = $('#wf-list').options[0];
+  if (first) await loadWorkflow(first.value);
+  else newWorkflow();
+  status(`已刪除「${name}」`, 'ok');
 }
 
 async function validate() {
@@ -474,7 +516,19 @@ function esc(s) {
 
 // ------------------------------------------------------------------ 綁定
 
-$('#btn-save').addEventListener('click', save);
+$('#btn-new').addEventListener('click', newWorkflow);
+$('#btn-save-as').addEventListener('click', () => save({ asNew: true }));
+$('#btn-delete').addEventListener('click', deleteWorkflow);
+$('#btn-save').addEventListener('click', () => {
+  // 覆蓋隨附範本是不可逆的（seeder 只在 db 裡沒有該 id 時才匯入），先問一次
+  if (SHIPPED.has(state.workflowId)
+      && !confirm(`「${$('#wf-name').value}」是隨附的範本。\n`
+                  + '直接儲存會覆蓋它，而且不會自動還原。\n\n'
+                  + '要保留原本的範本，請改按「另存新檔」。\n\n仍要覆蓋嗎？')) {
+    return;
+  }
+  save();
+});
 $('#btn-run').addEventListener('click', run);
 $('#btn-validate').addEventListener('click', validate);
 $('#wf-list').addEventListener('change', (e) => loadWorkflow(e.target.value));

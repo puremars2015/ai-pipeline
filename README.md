@@ -149,6 +149,38 @@ commit 包含的那些），只有一個就直接指過去，多個（圖 fan-ou
   這同時解決三件事：`../..` 之類的路徑穿越、macOS 檔案系統不分大小寫導致
   節點 `A` 與 `a` 撞到同一個目錄、以及不必為了安全去限制既有工作流的 id 格式。
 
+## 新增工作流
+
+三種方式：
+
+**在編輯器裡拉** —— 按「新增」清空畫布，從左邊拖節點、連線，填名稱後按
+「另存新檔」。已經開著某個工作流時，「儲存」是**覆蓋它**，「另存新檔」才是
+產生一份新的。開著隨附範本按儲存會先跳確認。
+
+**放一個 JSON 到 `workflows/`** —— 下次啟動服務時自動匯入（只匯入 db 裡還沒有
+的 id）。格式見現有的兩個範本，或用編輯器存一份再從 API 拉下來當骨架：
+
+```bash
+curl -s localhost:5111/api/workflows/<id> > workflows/my-flow.json
+```
+
+**打 API**：
+
+```bash
+curl -X POST localhost:5111/api/workflows -H 'Content-Type: application/json' -d @my-flow.json
+```
+
+沒有 `id` 欄位就配一個新的；有 `id` 就是覆蓋那一個。
+
+### 範本被改壞了怎麼還原
+
+啟動時只會匯入「db 裡還沒有」的工作流，所以覆蓋掉不會自己還原：
+
+```bash
+.venv/bin/python -m tools.reseed            # 先看差異
+.venv/bin/python -m tools.reseed --apply    # 從 workflows/ 覆蓋回去
+```
+
 ## 隨附的範本
 
 | 範本 | 做什麼 |
@@ -239,7 +271,7 @@ engine/
 adapters/                 <id>.yaml + normalizers/<id>.py
 nodes/ store/ templates/ static/
 workflows/  plan-impl-qa.json  codex-review.json
-tools/  doctor.py probe.py watch.py
+tools/  doctor.py probe.py watch.py reseed.py
 ```
 
 前端只有 `static/js/graph.js` 知道 Drawflow 的資料長相，想換成 LiteGraph
