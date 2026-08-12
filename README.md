@@ -191,7 +191,7 @@ CLI 不在 PATH 上時，yaml 可以用 `binary_candidates` 列候選絕對路�
 ## 開發
 
 ```bash
-.venv/bin/python -m pytest -q          # 192 個測試，不呼叫 LLM
+.venv/bin/python -m pytest -q          # 219 個測試，不呼叫 LLM
 .venv/bin/python -m tools.watch <run>  # 在終端機盯一個 run
 ```
 
@@ -238,7 +238,7 @@ engine/
   service.py              run 生命週期（背景執行緒）
 adapters/                 <id>.yaml + normalizers/<id>.py
 nodes/ store/ templates/ static/
-workflows/plan-impl-qa.json
+workflows/  plan-impl-qa.json  codex-review.json
 tools/  doctor.py probe.py watch.py
 ```
 
