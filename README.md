@@ -186,6 +186,7 @@ curl -X POST localhost:5111/api/workflows -H 'Content-Type: application/json' -d
 | 範本 | 做什麼 |
 |---|---|
 | `sample-project-notes` | **第一次試跑用這個。需求已經填好**，設定好 `project_repo` 直接按執行 |
+| `sample-opencode-pi` | 需求已填好。opencode 寫小工具 → pi 唯讀審查 → 沒過打回去改 |
 | `plan-impl-qa` | 需求 → Codex 規劃 → Claude 實作 → 測試 → Codex QA，沒過就打回去修 |
 | `codex-review` | 把目前 branch 對齊進 worktree → Codex 對照 main 審查 → 有問題就讓 Claude 修 → 再審 |
 
@@ -218,6 +219,28 @@ pytest 依賴或記載 pytest 指令，因此不將其列為正式支援的指�
 審查節點是唯讀 sandbox + JSON schema，每個 finding 都必須說得出
 `why_it_breaks`（什麼情況下會壞）。實測它會為了確認而真的去跑實驗，
 也會拒絕回報「這是設計偏好而非 bug」的東西。
+
+### `sample-opencode-pi`（需求已填好，示範 opencode + pi）
+
+opencode 寫一個字串處理小工具（`stringutils.py` + 測試），pi 只給 `read`/`grep`
+兩個工具做唯讀審查，沒過就打回去改。兩者都走 OpenRouter：
+
+```bash
+source ~/.hermes/.env        # 或你放 OPENROUTER_API_KEY 的地方
+.venv/bin/python app.py      # 要在有這個環境變數的 shell 裡啟動
+```
+
+`OPENROUTER_API_KEY` 要在**啟動 `app.py` 的那個 shell**裡就有 —— 子行程繼承的
+是 Flask 服務行程的環境變數，不是你之後在別的分頁匯出的。config.local.yaml
+不會幫你載入 `.env`。
+
+pi 這個 adapter 不支援結構化輸出（`supports_schema: false`），所以審查結論走
+純文字的 `VERDICT: PASS` / `VERDICT: FAIL` 約定，`gate` 節點的運算式對應著
+比對這個字串，不是讀 JSON。
+
+實跑一次（scratch repo，claude-haiku-4.5 經 OpenRouter）第一輪就過，
+18 個測試全過，pi 的審查逐項對照實際檔案內容確認（不是空泛的稱讚），
+總花費約 $0.02。
 
 ## 接一個新的 agent CLI
 

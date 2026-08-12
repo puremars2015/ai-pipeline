@@ -366,3 +366,70 @@ def test_sample_template_mechanical_check_catches_extra_files():
     # 檢查節點失敗不該直接中止 run —— 那是要交給條件節點判斷的訊號
     assert graph.nodes["check"].on_error == "continue"
     assert graph.nodes["check"].mutates is False
+
+
+# --------------------------------- sample-opencode-pi（需求已填好）
+
+OC_PI_TEMPLATE = ROOT / "workflows" / "sample-opencode-pi.json"
+
+
+def test_opencode_pi_template_is_valid_and_selfcontained():
+    payload = json.loads(OC_PI_TEMPLATE.read_text("utf-8"))
+    graph = parse(payload)
+    assert validate(graph, [s.id for s in Registry().all()]) == []
+
+    text = graph.nodes["req"].config.get("text") or ""
+    assert len(text) > 100, "需求沒有填好"
+    assert "stringutils" in text
+
+    agents = {n.type for n in graph.nodes.values()
+              if not n.is_builtin and n.type != "shell"}
+    assert agents == {"opencode", "pi"}, f"這個範本應該只用 opencode 與 pi，實際 {agents}"
+
+    assert {(e.src, e.port, e.dst) for e in graph.back_edges()} == {
+        ("gate", "false", "write")
+    }
+    assert parse(to_dict(graph)) is not None
+
+
+def test_opencode_pi_template_review_is_readonly():
+    """pi 審查節點只給 read/grep，寫不了東西 —— 唯讀審查要名副其實。"""
+    graph = parse(json.loads(OC_PI_TEMPLATE.read_text("utf-8")))
+    review = graph.nodes["review"]
+    assert review.mutates is False
+    tools = review.config.get("tools") or ""
+    assert set(t.strip() for t in tools.split(",")) == {"read", "grep"}
+    assert "bash" not in tools and "write" not in tools and "edit" not in tools
+
+
+def test_opencode_pi_template_gate_matches_plaintext_verdict():
+    """pi 這個 adapter 不支援 schema，審查結論走的是純文字 VERDICT: PASS/FAIL
+    的約定，不是 JSON —— gate 的運算式要對得上這個約定。"""
+    graph = parse(json.loads(OC_PI_TEMPLATE.read_text("utf-8")))
+    assert "pi" == graph.nodes["review"].type
+    assert graph.nodes["review"].config.get("schema") is None
+    assert "VERDICT: PASS" in graph.nodes["gate"].config["expr"]
+
+
+def test_opencode_pi_template_runs_with_mocks(scratch, tmp_path):
+    payload = json.loads(OC_PI_TEMPLATE.read_text("utf-8"))
+    for node in payload["nodes"]:
+        if node["id"] == "write":
+            node["type"] = "mock"
+            node["config"]["script"] = script(
+                message="寫好了", files={"stringutils.py": "def slugify(t): return t\n"},
+            )
+        elif node["id"] == "test":
+            node["config"]["command"] = "echo '18 passed'"
+        elif node["id"] == "review":
+            node["type"] = "mock"
+            node["config"]["script"] = script(message="檢查過了\nVERDICT: PASS")
+        elif node["id"] == "done":
+            node["config"]["command"] = "echo done"
+
+    repo, ws = scratch
+    result, ctx, _ = run_template(payload, ws, tmp_path)
+
+    assert result.status == PASSED, result.reason
+    assert "VERDICT: PASS" in ctx.nodes["review"].last_message
+    assert result.node_status["done"] == PASSED

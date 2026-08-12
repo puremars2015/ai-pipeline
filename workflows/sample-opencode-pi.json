@@ -1,0 +1,96 @@
+{
+  "id": "sample-opencode-pi",
+  "name": "【範例，需求已填好】opencode + pi 接力寫小工具",
+  "settings": {
+    "isolation": "shared",
+    "max_run_steps": 30,
+    "description": "示範 opencode 與 pi 兩個 adapter：opencode 寫一個小的純函式模組，pi 唯讀審查（只用 read/grep，不給寫入權限），有問題就打回去改。兩者都走 OpenRouter，需要 OPENROUTER_API_KEY 環境變數（見下方 pi 節點的 provider 設定）。"
+  },
+  "nodes": [
+    {
+      "id": "req",
+      "type": "requirement",
+      "label": "需求（已填好）",
+      "pos": { "x": 40, "y": 90 },
+      "config": {
+        "text": "建立 stringutils.py，實作三個純函式：\n\n1. slugify(text): 轉成網址友善的 slug —— 小寫、非英數字轉成單一個 '-'、頭尾不留 '-'\n2. truncate(text, length): 超過 length 就截斷並補 '...'（含 '...' 總長度不超過 length），沒超過就原樣回傳\n3. word_count(text): 回傳單字數（用空白分隔），空字串回傳 0\n\n同時建立 tests/test_stringutils.py，每個函式至少兩個測試案例，包含空字串、\n一般情況、edge case（例如 slugify 全是特殊符號的輸入、truncate 剛好等於 length）。\n\n限制：\n- 只能用標準函式庫，不可以加任何依賴\n- 只新增這兩個檔案，不要動任何既有檔案\n- 每個函式要有一行 docstring"
+      }
+    },
+    {
+      "id": "write",
+      "type": "opencode",
+      "label": "opencode 實作",
+      "max_visits": 3,
+      "pos": { "x": 290, "y": 90 },
+      "config": {
+        "model": "openrouter/anthropic/claude-haiku-4.5",
+        "prompt": "依照以下需求實作。這是第 {{ loop.iteration }} 輪。\n\n== 需求 ==\n{{ requirement }}\n\n{% if nodes.review.structured %}== 上一輪審查發現的問題（必須逐項修掉）==\n{% for issue in nodes.review.structured.issues %}- {{ issue }}\n{% endfor %}\n{{ nodes.review.structured.summary }}\n{% endif %}完成後簡短說明你寫了什麼、每個函式的邊界情況怎麼處理的。"
+      }
+    },
+    {
+      "id": "commit",
+      "type": "git",
+      "label": "Commit",
+      "pos": { "x": 540, "y": 90 },
+      "config": {
+        "action": "commit",
+        "message": "feat: stringutils（第 {{ loop.iteration }} 輪）[{{ run.id }}]"
+      }
+    },
+    {
+      "id": "test",
+      "type": "shell",
+      "label": "跑測試",
+      "mutates": false,
+      "on_error": "continue",
+      "pos": { "x": 790, "y": 90 },
+      "config": {
+        "command": "set -u\nPY=\"\"\nfor c in .venv/bin/python venv/bin/python \"{{ run.repo }}/.venv/bin/python\" \"{{ run.repo }}/venv/bin/python\"; do\n  [ -x \"$c\" ] && PY=\"$c\" && break\ndone\n[ -z \"$PY\" ] && PY=python3\n\nif ! \"$PY\" -c 'import pytest' >/dev/null 2>&1; then\n  echo \"SKIPPED: 找不到裝了 pytest 的直譯器，改用內建 unittest 探索\"\n  \"$PY\" -m unittest discover -s tests -v\n  exit $?\nfi\n\n\"$PY\" -m pytest tests/test_stringutils.py -v",
+        "expect_exit_code": 0
+      }
+    },
+    {
+      "id": "review",
+      "type": "pi",
+      "label": "pi 唯讀審查",
+      "mutates": false,
+      "max_visits": 3,
+      "pos": { "x": 290, "y": 330 },
+      "config": {
+        "provider": "openrouter",
+        "model": "anthropic/claude-haiku-4.5",
+        "tools": "read,grep",
+        "prompt": "審查 stringutils.py 與它的測試，對照需求逐條確認。這是第 {{ loop.iteration }} 輪。\n\n== 需求 ==\n{{ requirement }}\n\n== 測試結果（exit {{ nodes.test.exit_code }}）==\n{{ nodes.test.stdout }}\n\n你只有 read 跟 grep 兩個工具，去讀 stringutils.py 跟 tests/test_stringutils.py\n的實際內容（不是聽別人講的），檢查：\n\n1. 三個函式都存在且邊界情況處理正確（slugify 的頭尾 '-'、truncate 的長度\n   計算含 '...'、word_count 的空字串）\n2. 測試涵蓋你在需求裡看到的那些 edge case\n3. 有沒有引入任何標準函式庫以外的依賴\n4. 測試是不是真的通過了（看上面的測試結果，不要只看程式碼猜）\n\n最後用一行純文字回覆，格式必須是下面兩種之一，不要加其他內容：\n\nVERDICT: PASS\n\n或\n\nVERDICT: FAIL\n問題1\n問題2\n（每行一個問題，具體到哪個函式、什麼情況）"
+      }
+    },
+    {
+      "id": "gate",
+      "type": "condition",
+      "label": "通過？",
+      "pos": { "x": 540, "y": 330 },
+      "config": {
+        "expr": "'VERDICT: PASS' in (nodes.review.last_message or '') and nodes.test.exit_code == 0"
+      }
+    },
+    {
+      "id": "done",
+      "type": "shell",
+      "label": "完成",
+      "mutates": false,
+      "pos": { "x": 790, "y": 330 },
+      "config": {
+        "command": "set -u\nBASE=\"{{ run.base_sha }}\"\necho '=== pi 的審查結論 ==='\necho '{{ nodes.review.last_message }}'\necho\necho '=== 本次 run 的 commit ==='\ngit --no-pager log --oneline \"${BASE}\"..HEAD\necho\necho \"合併：git merge --no-ff {{ run.branch }}\"",
+        "expect_exit_code": 0
+      }
+    }
+  ],
+  "edges": [
+    { "from": "req", "to": "write" },
+    { "from": "write", "to": "commit" },
+    { "from": "commit", "to": "test" },
+    { "from": "test", "to": "review" },
+    { "from": "review", "to": "gate" },
+    { "from": "gate", "to": "done", "port": "true" },
+    { "from": "gate", "to": "write", "port": "false" }
+  ]
+}

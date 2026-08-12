@@ -336,15 +336,16 @@ def test_pi_maps_real_events():
 
 def test_pi_usage_uses_pi_field_names():
     """pi 的 Usage 是 input/output/cacheRead/cacheWrite/totalTokens/cost.total，
-    欄位名跟其他三家都不一樣，要正確映射成統一的名字。"""
+    欄位名跟其他三家都不一樣，要正確映射成統一的名字。數字對照實跑的 fixture
+    （OpenRouter + claude-haiku-4.5，見 tests/fixtures/README.md）。"""
     events = run_fixture(pi_norm.normalize, "pi.jsonl")
     usage = first(events, USAGE)["data"]
-    assert usage["input_tokens"] == 1520
-    assert usage["output_tokens"] == 48
-    assert usage["reasoning_output_tokens"] == 12
-    assert usage["total_tokens"] == 1568
+    assert usage["input_tokens"] == 2530
+    assert usage["output_tokens"] == 170
+    assert usage["reasoning_output_tokens"] == 72
+    assert usage["total_tokens"] == 2700
     assert usage["total_cost_usd"] > 0
-    assert usage["provider"] == "google"
+    assert usage["provider"] == "openrouter"
 
 
 def test_pi_ignores_delta_and_duplicate_events():
