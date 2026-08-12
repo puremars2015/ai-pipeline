@@ -221,3 +221,74 @@ def test_no_git_hooks_involved(scratch, tmp_path):
         mockify(json.loads(TEMPLATE.read_text("utf-8")), ["PASS"]), ws, tmp_path
     )
     assert result.status == PASSED, result.reason
+
+
+# ------------------------------------------------ codex-review 範本
+
+REVIEW_TEMPLATE = ROOT / "workflows" / "codex-review.json"
+
+
+def test_review_template_is_valid():
+    graph = parse(json.loads(REVIEW_TEMPLATE.read_text("utf-8")))
+    assert validate(graph, [s.id for s in Registry().all()]) == []
+    assert [n.id for n in graph.entrypoints()] == ["req"]
+    # 修正迴圈：commit 回到 review
+    assert {(e.src, e.port, e.dst) for e in graph.back_edges()} == {
+        ("commit", "out", "review")
+    }
+    # review 的前向入邊只有 checkout —— 第一輪不會死等還沒跑的 commit
+    assert [e.src for e in graph.forward_incoming("review")] == ["checkout"]
+    assert parse(to_dict(graph)) is not None
+
+
+def test_review_template_shell_vars_are_braced():
+    """$VAR 後面直接接非 ASCII 時，bash 在某些 locale 會把那些位元組吃進變數名，
+    配上 set -u 就變成 unbound variable。實際踩過，整個節點只有 exit 127。"""
+    import re
+
+    graph = parse(json.loads(REVIEW_TEMPLATE.read_text("utf-8")))
+    bad = re.compile(r"\$[A-Z_][A-Z0-9_]*(?=[^\x00-\x7f])")
+    for node in graph.nodes.values():
+        command = node.config.get("command") or ""
+        found = bad.findall(command)
+        assert not found, f"節點 {node.id} 有沒加大括號的變數接著全形字: {found}"
+
+
+def test_review_template_reviewer_is_readonly_and_typed():
+    """審查節點必須是唯讀且回傳 typed JSON —— 這是它比人工掃 diff 可靠的原因。"""
+    graph = parse(json.loads(REVIEW_TEMPLATE.read_text("utf-8")))
+    review = graph.nodes["review"]
+    assert review.mutates is False
+    assert review.config["sandbox"] == "read-only"
+
+    schema = json.loads(review.config["schema"])
+    assert schema["properties"]["verdict"]["enum"] == ["PASS", "FAIL"]
+    issue = schema["properties"]["issues"]["items"]["properties"]
+    # 每個 finding 都要說得出「什麼情況下會壞」
+    assert {"severity", "file", "problem", "why_it_breaks", "fix"} == set(issue)
+
+
+def test_review_template_runs_with_mocks(scratch, tmp_path):
+    """用 mock 跑完整條路徑：審查 FAIL → 修正 → 重審 PASS。"""
+    graph = json.loads(REVIEW_TEMPLATE.read_text("utf-8"))
+    for node in graph["nodes"]:
+        if node["id"] == "checkout":
+            node["config"]["command"] = "echo '審查對象: mock（領先 1 個 commit）'"
+        elif node["id"] == "review":
+            node["type"] = "mock"
+            node["config"]["script"] = script(structured={
+                "verdict": "PASS", "issues": [], "summary": "沒有問題",
+            })
+        elif node["id"] == "fix":
+            node["type"] = "mock"
+            node["config"]["script"] = script(message="修好了")
+        elif node["id"] == "report":
+            node["config"]["command"] = "echo 通過"
+
+    repo, ws = scratch
+    result, ctx, _ = run_template(graph, ws, tmp_path, requirement="看安全性")
+
+    assert result.status == PASSED, result.reason
+    assert ctx.nodes["review"].structured["verdict"] == "PASS"
+    assert result.node_status["report"] == PASSED
+    assert result.node_status["fix"] == "skipped"

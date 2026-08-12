@@ -707,3 +707,38 @@ def test_git_commit_after_file_change_and_diff_visible(tmp_path):
         assert not (ws.path / "changes.diff").exists()
     finally:
         ws.remove()
+
+
+def test_non_utf8_output_does_not_silently_truncate(registry, tmp_path):
+    """子進程吐出非 UTF-8 位元組時，輸出不能整段消失。
+
+    實際踩過：一行 Big5 的 bash 錯誤訊息讓整個節點看起來毫無輸出、只有
+    exit 127，完全查不出原因。成因是 UnicodeDecodeError 屬於 ValueError，
+    被 reader thread 當成「pipe 關掉」吃掉了。
+    """
+    payload = {
+        "nodes": [{
+            "id": "sh",
+            "type": "shell",
+            "mutates": False,
+            "on_error": "continue",
+            "config": {
+                # 先吐壞位元組，再吐正常內容 —— 後面這段一定要看得到
+                "command": r"printf 'bad:\xef\xbc oops\n' >&2; echo AFTER_BAD_BYTES; "
+                           r"printf '\xff\xfe\n'; echo STILL_ALIVE",
+                "expect_exit_code": 0,
+            },
+        }],
+        "edges": [],
+    }
+    run, ctx, rec = build(payload, registry, tmp_path)
+    result = run.run()
+
+    assert result.status == PASSED, result.reason
+    out = ctx.nodes["sh"].stdout
+    assert "AFTER_BAD_BYTES" in out, f"壞位元組之後的輸出被吞掉了: {out!r}"
+    assert "STILL_ALIVE" in out, f"串流在壞位元組後中斷了: {out!r}"
+
+    # 壞位元組本身以替代字元呈現，不會讓整條流程失敗
+    texts = " ".join(e["text"] for _, e in rec.events)
+    assert "oops" in texts

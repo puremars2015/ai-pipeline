@@ -1,0 +1,134 @@
+{
+  "id": "codex-review",
+  "name": "Codex 審查目前 branch（含修正迴圈）",
+  "settings": {
+    "isolation": "shared",
+    "max_run_steps": 40,
+    "description": "把目標 repo 目前 checkout 的 branch 對齊進 worktree，交給 Codex 對照 main 審查，有問題就讓 Claude Code 修、再送回去審，直到通過或撞上重試上限。修正發生在拋棄式的 task branch 上，不會動到你手上的工作目錄。"
+  },
+  "nodes": [
+    {
+      "id": "req",
+      "type": "requirement",
+      "label": "審查重點",
+      "pos": {
+        "x": 40,
+        "y": 90
+      }
+    },
+    {
+      "id": "checkout",
+      "type": "shell",
+      "label": "對齊目標 branch",
+      "pos": {
+        "x": 290,
+        "y": 90
+      },
+      "config": {
+        "command": "set -u\nREPO=\"{{ run.repo }}\"\nBASE=\"{{ run.base_sha }}\"\n\n# 要審哪一條：預設是目標 repo 目前 checkout 的 branch。\n# 想固定審某一條，把下面這行換成 TARGET=\"你的分支名\"。\nTARGET=\"$(git -C \"$REPO\" rev-parse --abbrev-ref HEAD)\"\n\nif [ \"$TARGET\" = \"HEAD\" ]; then\n  echo \"目標 repo 處於 detached HEAD，判斷不出要審哪一條 branch。\"\n  echo \"請先 checkout 一條 branch，或把這個節點的 TARGET 寫死。\"\n  exit 1\nfi\n\nif ! git rev-parse --verify \"$TARGET\" >/dev/null 2>&1; then\n  echo \"找不到 branch: $TARGET\"\n  exit 1\nfi\n\nAHEAD=\"$(git rev-list --count \"$BASE\"..\"$TARGET\")\"\nif [ \"$AHEAD\" = \"0\" ]; then\n  echo \"$TARGET 相對基準沒有任何領先的 commit —— 沒東西可審。\"\n  exit 1\nfi\n\n# 把這次 run 的 worktree 對齊到目標 branch。\n# 之後 {{ '{{ run.diff }}' }} 就剛好是「這條 branch 相對 main 的完整變更」，\n# 修正也會 commit 在它上面。動的是拋棄式的 task branch，不是 $TARGET 本身。\ngit reset --hard \"$TARGET\" >/dev/null\n\necho \"審查對象: ${TARGET}（領先基準 $AHEAD 個 commit）\"\necho\necho '--- commits ---'\ngit --no-pager log --oneline \"$BASE\"..HEAD | head -40\necho\necho '--- 變更統計 ---'\ngit --no-pager diff --stat \"$BASE\"",
+        "expect_exit_code": 0
+      }
+    },
+    {
+      "id": "review",
+      "type": "codex",
+      "label": "Codex 審查",
+      "mutates": false,
+      "max_visits": 3,
+      "pos": {
+        "x": 540,
+        "y": 90
+      },
+      "config": {
+        "sandbox": "read-only",
+        "schema": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"PASS\",\"FAIL\"]},\"issues\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"critical\",\"major\",\"minor\"]},\"file\":{\"type\":\"string\"},\"problem\":{\"type\":\"string\"},\"why_it_breaks\":{\"type\":\"string\"},\"fix\":{\"type\":\"string\"}},\"required\":[\"severity\",\"file\",\"problem\",\"why_it_breaks\",\"fix\"],\"additionalProperties\":false}},\"summary\":{\"type\":\"string\"}},\"required\":[\"verdict\",\"issues\",\"summary\"],\"additionalProperties\":false}",
+        "prompt": "你是嚴格的 code reviewer。審查以下變更，找出真正會出錯的問題。這是第 {{ loop.iteration }} 輪。\n\n{% if requirement %}== 這次特別要看的地方 ==\n{{ requirement }}\n\n{% endif %}== 變更概況 ==\n{{ nodes.checkout.stdout }}\n\n== 變更的檔案 ==\n{% for f in run.changed_files %}- {{ f }}\n{% endfor %}\n\n== 完整 diff ==\n{{ run.diff[:150000] }}\n\n{% if nodes.fix.last_message %}== 上一輪修正者的說明 ==\n{{ nodes.fix.last_message }}\n\n注意：這是他自己講的，不是事實。只認上面 diff 裡實際存在的程式碼。\n{% endif %}\n你可以讀 repo 裡的任何檔案來確認上下文（sandbox 是唯讀）。\n\n只回報你能具體說出「什麼情況下會壞」的問題：\n- 併發正確性、資料遺失、安全性（路徑穿越、注入、權限）\n- 錯誤處理的漏洞、邊界情況\n- 與既有行為不相容的回歸\n\n不要列風格偏好，不要列你沒實際確認過的猜測。若某處你檢查過覺得沒問題，不用提。\n沒有找到這種等級的問題就回 verdict=PASS、issues 空陣列。\n\n以 JSON 回覆。"
+      }
+    },
+    {
+      "id": "gate",
+      "type": "condition",
+      "label": "審查通過？",
+      "pos": {
+        "x": 790,
+        "y": 90
+      },
+      "config": {
+        "expr": "nodes.review.structured.verdict == 'PASS'"
+      }
+    },
+    {
+      "id": "fix",
+      "type": "claude",
+      "label": "Claude Code 修正",
+      "max_visits": 3,
+      "pos": {
+        "x": 290,
+        "y": 330
+      },
+      "config": {
+        "permission_mode": "bypassPermissions",
+        "prompt": "Codex 審查了這條 branch，提出以下問題。請逐項處理。這是第 {{ loop.iteration }} 輪。\n\n== 審查結論 ==\n{{ nodes.review.structured.summary }}\n\n== 問題清單 ==\n{% for issue in nodes.review.structured.issues %}\n[{{ issue.severity }}] {{ issue.file }}\n  問題：{{ issue.problem }}\n  何時會壞：{{ issue.why_it_breaks }}\n  建議：{{ issue.fix }}\n{% endfor %}\n\n處理原則：\n- 先確認問題是真的。你可以直接執行指令（跑測試、寫小腳本重現）。\n- 若某一項你判斷是誤報，不要照改 —— 在回覆裡說明為什麼，下一輪審查會看到。\n- 建議只是建議。若有更好的解法（例如兩個問題有共同的根因，一次解掉），就那樣做並說明。\n- 修完要跑測試確認沒弄壞別的東西。\n- 不要新增與修正無關的檔案，尤其不要寫「修正報告」之類的說明文件來取代真的驗證。\n\n回覆請簡短說明：每一項你怎麼處理的、有沒有哪項判斷是誤報、為什麼。"
+      }
+    },
+    {
+      "id": "commit",
+      "type": "git",
+      "label": "Commit 修正",
+      "pos": {
+        "x": 540,
+        "y": 330
+      },
+      "config": {
+        "action": "commit",
+        "message": "fix: 依 codex 審查修正（第 {{ loop.iteration }} 輪）[{{ run.id }}]"
+      }
+    },
+    {
+      "id": "report",
+      "type": "shell",
+      "label": "通過摘要",
+      "mutates": false,
+      "pos": {
+        "x": 790,
+        "y": 330
+      },
+      "config": {
+        "command": "set -u\nBASE=\"{{ run.base_sha }}\"\necho '=== 審查通過 ==='\necho '{{ nodes.review.structured.summary }}'\necho\necho '--- 這次 run 的所有 commit ---'\ngit --no-pager log --oneline \"$BASE\"..HEAD\necho\necho '--- 相對基準的變更 ---'\ngit --no-pager diff --stat \"$BASE\"\necho\nif [ \"$(git rev-list --count \"$BASE\"..HEAD)\" != \"$(git rev-list --count \"$BASE\"..{{ run.branch }} 2>/dev/null || echo 0)\" ]; then\n  echo '（本次有新增修正 commit，在 {{ run.branch }} 上）'\nfi\necho \"合併：git merge --no-ff {{ run.branch }}\"",
+        "expect_exit_code": 0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "req",
+      "to": "checkout"
+    },
+    {
+      "from": "checkout",
+      "to": "review"
+    },
+    {
+      "from": "review",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "to": "report",
+      "port": "true"
+    },
+    {
+      "from": "gate",
+      "to": "fix",
+      "port": "false"
+    },
+    {
+      "from": "fix",
+      "to": "commit"
+    },
+    {
+      "from": "commit",
+      "to": "review"
+    }
+  ]
+}

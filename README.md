@@ -149,6 +149,23 @@ commit 包含的那些），只有一個就直接指過去，多個（圖 fan-ou
   這同時解決三件事：`../..` 之類的路徑穿越、macOS 檔案系統不分大小寫導致
   節點 `A` 與 `a` 撞到同一個目錄、以及不必為了安全去限制既有工作流的 id 格式。
 
+## 隨附的範本
+
+| 範本 | 做什麼 |
+|---|---|
+| `plan-impl-qa` | 需求 → Codex 規劃 → Claude 實作 → 測試 → Codex QA，沒過就打回去修 |
+| `codex-review` | 把目前 branch 對齊進 worktree → Codex 對照 main 審查 → 有問題就讓 Claude 修 → 再審 |
+
+`codex-review` 的第一個節點會 `git reset --hard` 到目標 branch，所以之後
+`{{ run.diff }}` 剛好是「這條 branch 相對 main 的完整變更」，修正也 commit 在
+它上面。動的是拋棄式的 `task/<run-id>`，你手上的 branch 不會被碰。
+預設審目標 repo 目前 checkout 的那條；想固定審某一條，把 checkout 節點的
+`TARGET=` 那行改掉。
+
+審查節點是唯讀 sandbox + JSON schema，每個 finding 都必須說得出
+`why_it_breaks`（什麼情況下會壞）。實測它會為了確認而真的去跑實驗，
+也會拒絕回報「這是設計偏好而非 bug」的東西。
+
 ## 接一個新的 agent CLI
 
 放兩個檔案，不用改引擎：

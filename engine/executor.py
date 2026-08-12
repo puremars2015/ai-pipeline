@@ -63,12 +63,23 @@ class NodeResult:
 
 
 def _pump(stream, tag: str, sink: queue.Queue) -> None:
-    """把一個檔案流逐行推進 queue，結束時推 EOF 哨兵。"""
+    """把一個檔案流逐行推進 queue，結束時推 EOF 哨兵。
+
+    例外處理要分清楚：pipe 被關掉（進程被殺）是正常的，靜靜結束就好；
+    其他例外必須讓使用者看到，不能默默把剩下的輸出吞掉。
+
+    特別是解碼錯誤 —— UnicodeDecodeError 是 ValueError 的子類，原本會被
+    「pipe 關掉」那條 except 一起吃掉，結果是輸出突然中斷而且完全沒有線索。
+    實際踩過：一行非 UTF-8 的 stderr 讓整個節點看起來毫無輸出、只有 exit 127。
+    現在 Popen 已經用 errors="replace" 不會再丟解碼錯誤，這裡是第二道防線。
+    """
     try:
         for line in stream:
             sink.put((tag, line.rstrip("\n")))
-    except (ValueError, OSError):
+    except (BrokenPipeError, OSError):
         pass  # 進程被殺掉時 pipe 會關閉
+    except Exception as exc:  # noqa: BLE001
+        sink.put((tag, f"[讀取 {tag} 時發生錯誤: {type(exc).__name__}: {exc}]"))
     finally:
         sink.put((tag, _EOF))
 
@@ -135,6 +146,11 @@ def execute(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # 明確指定 UTF-8 並容忍壞位元組。預設會用 locale 編碼且 errors="strict"，
+        # 只要子進程吐出一個非 UTF-8 的位元組（不同編碼的錯誤訊息、二進位雜訊）
+        # 就會丟 UnicodeDecodeError，之後的輸出全部看不到。
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         # 自己一個 process group，才能連子進程一起殺乾淨
         start_new_session=True,
