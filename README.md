@@ -259,15 +259,14 @@ adapters/normalizers/<id>.py    # 怎麼解讀它的事件輸出
 
 內建 adapter 的 normalizer 都是照 probe 抓回來的 fixture 寫的，CLI 升版後重跑
 probe，測試就會抓到 schema 變動。每份 fixture 的來源與可信度記在
-`tests/fixtures/README.md`（pi 的部分因為本機沒憑證，是依它自己的 docs/json.md
-與 types.d.ts 構造的，設定憑證後請重跑 probe 覆蓋）。
+`tests/fixtures/README.md`。
 
 CLI 不在 PATH 上時，yaml 可以用 `binary_candidates` 列候選絕對路徑。
 
 ## 開發
 
 ```bash
-.venv/bin/python -m pytest -q          # 219 個測試，不呼叫 LLM
+.venv/bin/python -m pytest -q          # 226 個測試，不呼叫 LLM
 .venv/bin/python -m tools.watch <run>  # 在終端機盯一個 run
 ```
 
@@ -315,6 +314,7 @@ engine/
 adapters/                 <id>.yaml + normalizers/<id>.py
 nodes/ store/ templates/ static/
 workflows/  plan-impl-qa.json  codex-review.json
+            sample-project-notes.json  sample-opencode-pi.json
 tools/  doctor.py probe.py watch.py reseed.py
 ```
 
