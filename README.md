@@ -5,6 +5,8 @@
 工具呼叫、改了哪些檔案都即時顯示在同一張圖上。
 
 流程定義是資料，不是程式碼 —— 改流程是拖線，不是改 bash。
+而且它跟著專案走：工作流存成目標 repo 裡的 JSON 檔，進 git、可 review、
+同事 clone 下來就有。
 
 ## 為什麼不是原本的 bash
 
@@ -12,7 +14,7 @@
 問題不是有 bug，是形狀錯了：改流程要改腳本、看不到執行狀況、QA 判定靠
 `head -1 | grep PASS`、失敗只能翻 log。
 
-現在流程存在資料庫裡，節點種類可插拔，QA 回傳的是 typed JSON。
+現在流程是目標 repo 裡的一份 JSON，節點種類可插拔，QA 回傳的是 typed JSON。
 
 ## 安裝
 
@@ -22,25 +24,69 @@
 uv venv && uv pip install -r requirements.txt
 ```
 
-設定目標 repo（`config.local.yaml` 不進 git）：
-
-```bash
-printf 'project_repo: "~/你的專案路徑"\n' > config.local.yaml
-```
-
-檢查環境（CLI 是否安裝、登入、模型設定是否相容、目標 repo 是否可用）：
-
-```bash
-.venv/bin/python -m tools.doctor
-```
-
 啟動：
 
 ```bash
 .venv/bin/python app.py
 ```
 
-開 http://localhost:5111
+開 http://localhost:5111，按右上角的**「管理」加入你的第一個專案** ——
+貼上目標 repo 的路徑（`~/你的專案` 也可以），它會在那個 repo 裡建立
+`.ai-workflow-proj/`，然後問你要不要從隨附範本開始。
+
+沒有全域的「目標 repo」設定：一個服務同時管多個專案，切換用右上角的下拉選單。
+
+檢查環境（CLI 是否安裝、登入、模型設定是否相容、各專案是否可用）：
+
+```bash
+.venv/bin/python -m tools.doctor
+```
+
+### 專案安全防線
+
+註冊專案時會擋下四種情況，因為路徑是從瀏覽器輸入的：目標不是 git repo、
+還沒有任何 commit、**git 根目錄解析成家目錄**（`~/.git` 意外存在時整個家目錄
+會變成一個 repo，在上面開 worktree 會試圖複製整個家目錄）、以及目標就是本工具
+自己。每次執行前會再驗一次。
+
+## 專案資料夾
+
+每個專案裡有一個 `.ai-workflow-proj/`：
+
+```
+<你的專案>/.ai-workflow-proj/
+  project.yaml          進 git：顯示名稱、main_branch、預設 isolation、guards 覆蓋
+  workflows/*.json      進 git：工作流定義（這才是 source of truth）
+  .gitignore            進 git：內容就一行 local/
+  local/                不進 git
+    ai-workflow.sqlite    這個專案的 run / node / event 紀錄
+    runs/<run-id>/artifacts/
+```
+
+分界線是**定義進 git、執行紀錄不進**。工作流是「這個專案要怎麼被 agent 處理」
+的知識，跟 `.github/workflows/` 一樣屬於專案本身；執行產物則是機器本地的東西，
+而且絕不能被 merge 進 `main`。`.gitignore` 本身有進 git，所以每個 worktree 裡
+也帶著同一條規則。
+
+worktree 刻意**不**在這裡，而是在 `<worktree_root>/<專案 id>/<run-id>`：
+`per_node` 模式的磁碟用量是「節點數 × repo 大小」，而且在 repo 自己的工作目錄
+底下開 worktree 會讓 `git status`、編輯器索引與 git 的路徑推理全都變得很怪。
+
+### 設定的合併順序（低 → 高）
+
+1. `config.yaml`（工具預設）
+2. `config.local.yaml`（這台機器，不進 git）
+3. `<專案>/.ai-workflow-proj/project.yaml`（專案，進 git）
+4. `<專案>/.ai-workflow-proj/local.yaml`（專案 × 這台機器，不進 git）
+5. 工作流自己的 `settings`（`isolation`、`max_run_steps`）
+
+可被專案覆蓋的：`main_branch`、`guards`、預設 `isolation`。
+`worktree_root` 只能在 `local.yaml` 覆蓋（那是機器路徑，不該進 git）。
+紀錄與產物的位置**不開放覆蓋** —— 它們一定在 `local/` 底下，是這個架構的一部分；
+可設定只會製造出「紀錄跑到別的地方去了」這種難查的狀況。
+
+多人協作時的分工：`project.yaml` 是團隊共識（大家用同一條基準分支），
+`local.yaml` 是你自己的（worktree 放哪）。
 
 ## 節點型別
 
@@ -92,7 +138,8 @@ nodes.qa.structured.verdict == 'PASS' and nodes.tests.exit_code == 0
 
 無論哪種模式，都**不會動到你手上的工作目錄**，也不會自動合併 —— 跑完留在
 branch 上，UI 的「變更」分頁直接給你合併指令。`plan.md` / QA 報告之類的產物
-存在 `runs/<run-id>/artifacts/`，在 repo 之外，不會混進 `main`。
+存在 `.ai-workflow-proj/local/runs/<run-id>/artifacts/`，跟著專案走但被
+`.gitignore` 擋住，不會混進 `main`。
 
 模式在編輯器工具列切換（存進工作流的 `settings.isolation`）。
 
@@ -151,41 +198,77 @@ commit 包含的那些），只有一個就直接指過去，多個（圖 fan-ou
 
 ## 新增工作流
 
-三種方式：
-
 **在編輯器裡拉** —— 按「新增」清空畫布，從左邊拖節點、連線，填名稱後按
 「另存新檔」。已經開著某個工作流時，「儲存」是**覆蓋它**，「另存新檔」才是
-產生一份新的。開著隨附範本按儲存會先跳確認。
+產生一份新的。存檔就是寫進 `<專案>/.ai-workflow-proj/workflows/<名稱>.json`。
 
-**放一個 JSON 到 `workflows/`** —— 下次啟動服務時自動匯入（只匯入 db 裡還沒有
-的 id）。格式見現有的兩個範本，或用編輯器存一份再從 API 拉下來當骨架：
+檔名就是工作流 id，而且允許中文 —— 資料夾裡看到的是
+`規劃 → 實作 → QA.json`，不是一串雜湊。JSON 存成有縮排、不逃逸非 ASCII 的
+格式，所以 `git diff` 看得出你改了哪個節點。
+
+**直接改檔案** —— 那些 JSON 就是唯一的真相，用編輯器改也行、用 VSCode 改也行。
+改壞了服務不會整個掛掉，那一個工作流會在清單裡標成「⚠ 壞掉」，其他的照常。
+
+**從隨附範本複製**：
 
 ```bash
-curl -s localhost:5111/api/workflows/<id> > workflows/my-flow.json
+.venv/bin/python -m tools.templates                              # 列出範本與已註冊專案
+.venv/bin/python -m tools.templates --project <id>               # 列出該專案現有的工作流
+.venv/bin/python -m tools.templates --project <id> --import plan-impl-qa
+.venv/bin/python -m tools.templates --project <id> --import all
 ```
 
-**打 API**：
+複製完就是那個專案自己的檔案，跟工具目錄的 `workflows/` 再無關係。
+不會覆蓋同名的既有工作流（會另外配一個 id）。
 
-```bash
-curl -X POST localhost:5111/api/workflows -H 'Content-Type: application/json' -d @my-flow.json
+註冊新專案時 UI 也會直接問你要不要匯入 —— 那是最順的時機。
+
+### 為什麼不自動塞範本
+
+註冊一個專案就在別人的 repo 裡放四個他沒要求、而且會進 git 的檔案，是不對的。
+所以範本一律是「你明確要求才複製」。
+
+## 同事怎麼拿到這些工作流
+
+`git pull` 就有了。`project.yaml` 與 `workflows/*.json` 都在版控裡，
+他只要在自己機器上把這個 repo 註冊進來（貼路徑，按新增），
+就會讀到同一批工作流；`local/` 是他自己的，不會互相干擾。
+
+## API
+
+工作流與執行紀錄都掛在專案底下 —— 光有 run id 是查不到的，
+得先知道去哪個專案的資料庫找。這也讓「拿 A 專案的設定去查 B 專案的 run」
+在結構上就不可能發生。
+
 ```
+GET    /api/projects                      專案清單（含每個的健康狀態）
+POST   /api/projects                      註冊：{"path": "~/code/app"}
+DELETE /api/projects/<pid>                只解除註冊，不刪任何檔案
 
-沒有 `id` 欄位就配一個新的；有 `id` 就是覆蓋那一個。
+GET    /api/projects/<pid>/workflows
+GET    /api/projects/<pid>/workflows/<wf>
+POST   /api/projects/<pid>/workflows      沒有 id 就配一個新的
+DELETE /api/projects/<pid>/workflows/<wf>
+POST   /api/projects/<pid>/workflows/import/<template>
 
-### 範本被改壞了怎麼還原
+POST   /api/projects/<pid>/runs           {"graph": …} 或 {"workflow_id": …}
+GET    /api/projects/<pid>/runs
+GET    /api/projects/<pid>/runs/<run>
+GET    /api/projects/<pid>/runs/<run>/diff
+GET    /api/projects/<pid>/runs/<run>/artifacts
+GET    /api/projects/<pid>/runs/<run>/events      SSE
+POST   /api/projects/<pid>/runs/<run>/cancel
 
-啟動時只會匯入「db 裡還沒有」的工作流，所以覆蓋掉不會自己還原：
-
-```bash
-.venv/bin/python -m tools.reseed            # 先看差異
-.venv/bin/python -m tools.reseed --apply    # 從 workflows/ 覆蓋回去
+GET    /api/runs                          跨專案總覽（合併各專案的資料庫）
+GET    /api/templates
+POST   /api/workflows/validate            純驗證，不需要專案
 ```
 
 ## 隨附的範本
 
 | 範本 | 做什麼 |
 |---|---|
-| `sample-project-notes` | **第一次試跑用這個。需求已經填好**，設定好 `project_repo` 直接按執行 |
+| `sample-project-notes` | **第一次試跑用這個。需求已經填好**，匯進專案直接按執行 |
 | `sample-opencode-pi` | 需求已填好。opencode 寫小工具 → pi 唯讀審查 → 沒過打回去改 |
 | `plan-impl-qa` | 需求 → Codex 規劃 → Claude 實作 → 測試 → Codex QA，沒過就打回去修 |
 | `codex-review` | 把目前 branch 對齊進 worktree → Codex 對照 main 審查 → 有問題就讓 Claude 修 → 再審 |
@@ -266,7 +349,7 @@ CLI 不在 PATH 上時，yaml 可以用 `binary_candidates` 列候選絕對路�
 ## 開發
 
 ```bash
-.venv/bin/python -m pytest -q          # 226 個測試，不呼叫 LLM
+.venv/bin/python -m pytest -q          # 301 個測試，不呼叫 LLM
 .venv/bin/python -m tools.watch <run>  # 在終端機盯一個 run
 ```
 
@@ -301,8 +384,9 @@ adapter 的 `binary_candidates` 有列候選位置。
 
 ```
 app.py                    Flask 入口：頁面、API、SSE
-settings.py               config.yaml + config.local.yaml 疊加載入
+settings.py               工具層設定（config.yaml + config.local.yaml）
 engine/
+  project.py              .ai-workflow-proj/ 的版面、初始化、設定合併
   graph.py                正規格式的解析與驗證（環、孤島、必填設定）
   runner.py               排程：join / fan-out / 環 / 寫入鎖 / 三道上限
   isolation.py            shared / per_node 兩種隔離模式
@@ -310,13 +394,21 @@ engine/
   context.py              節點間資料傳遞、Jinja 渲染、安全運算式求值
   workspace.py            worktree 生命週期 + 拒絕在 $HOME 上動手
   bus.py                  事件匯流：sqlite 持久化 + 多訂閱者扇出
-  service.py              run 生命週期（背景執行緒）
+  service.py              run 生命週期（背景執行緒），每個 run 綁一個專案
+store/
+  projects.py             專案註冊表（中央 db，只有這一張表）
+  stores.py               每專案一個紀錄資料庫 + 跨專案合併查詢
+  workflows.py            工作流的檔案存取（id 就是檔名，含路徑安全）
+  templates.py            隨附範本的讀取
+  db.py                   單一專案的 runs / node_runs / events
+  schema_registry.sql     中央：projects
+  schema_project.sql      各專案：runs / node_runs / events
 adapters/                 <id>.yaml + normalizers/<id>.py
-nodes/ store/ templates/ static/
-workflows/  plan-impl-qa.json  codex-review.json
-            sample-project-notes.json  sample-opencode-pi.json
-tools/  doctor.py probe.py watch.py reseed.py
+static/js/  project.js  editor.js  run.js  graph.js
+workflows/                隨附範本（複製進專案用，不是執行時讀的）
+tools/  doctor.py probe.py watch.py templates.py
 ```
 
 前端只有 `static/js/graph.js` 知道 Drawflow 的資料長相，想換成 LiteGraph
 （ComfyUI 用的那個）只要重寫那一個檔案。
+`static/js/project.js` 是專案選擇器，掛在 `base.html` 所以兩個頁面共用。
