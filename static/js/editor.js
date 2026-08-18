@@ -6,6 +6,7 @@
  */
 
 import { fromDrawflow, toDrawflow, portsOf, hasInput, makeNodeId } from './graph.js';
+import { activeProject, NO_PROJECT_HINT } from './project.js';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -16,10 +17,20 @@ const state = {
   workflowId: '',
   workflowName: '未命名工作流',
   settings: {},
+  project: null,     // 工作流住在專案裡，沒有專案就沒有工作流可存取
+  dirty: false,      // 畫布上有沒有還沒存回專案資料夾的變更
+  leaving: false,    // 我們自己發動的跳轉，別再問一次「確定要離開嗎」
 };
 
-// 隨附的範本：覆蓋它們是不可逆的，儲存前要多問一次
-const SHIPPED = new Set(['plan-impl-qa', 'codex-review']);
+// 切換專案、關掉分頁、重新整理都會讓編到一半的東西消失。用 beforeunload 而不是
+// 只攔選擇器 —— 這樣三種情況一次都顧到，也不必讓頁首知道編輯器的內部狀態。
+window.addEventListener('beforeunload', (e) => {
+  if (state.dirty && !state.leaving) e.preventDefault();
+});
+
+/** 這個專案的工作流端點。 */
+const wfUrl = (path = '') =>
+  `/api/projects/${encodeURIComponent(state.project.id)}/workflows${path}`;
 
 const KIND_LABEL = { builtin: '內建', agent: 'Agent', shell: '指令', mock: '測試' };
 
@@ -31,10 +42,21 @@ async function boot() {
 
   renderPalette([...builtins, ...adapters]);
   initEditor();
-  await loadWorkflowList();
 
-  const params = new URLSearchParams(location.search);
-  await loadWorkflow(params.get('wf') || 'plan-impl-qa');
+  // 專案的挑選與記憶由頁首的選擇器負責（base.html 掛的 mountPicker）
+  state.project = await activeProject();
+  if (!state.project) {
+    showProblems([NO_PROJECT_HINT]);
+    status('用右上角的「管理」加一個專案', 'bad');
+    return;
+  }
+
+  const ids = await loadWorkflowList();
+  const wanted = new URLSearchParams(location.search).get('wf');
+  // 沒有指定就開第一個；專案是空的（剛註冊）就直接給一張空畫布
+  if (wanted && ids.includes(wanted)) await loadWorkflow(wanted);
+  else if (ids.length) await loadWorkflow(ids[0]);
+  else newWorkflow();
 }
 
 function initEditor() {
@@ -382,13 +404,15 @@ function updateIsolationHint() {
 }
 
 async function loadWorkflowList() {
-  const { workflows } = await fetch('/api/workflows').then((r) => r.json());
+  const { workflows } = await fetch(wfUrl()).then((r) => r.json());
   $('#wf-list').innerHTML = workflows
-    .map((w) => `<option value="${esc(w.id)}">${esc(w.name)}</option>`).join('');
+    .map((w) => `<option value="${esc(w.id)}">${esc(w.name)}${w.broken ? ' ⚠ 壞掉' : ''}</option>`)
+    .join('');
+  return workflows.map((w) => w.id);
 }
 
 async function loadWorkflow(id) {
-  const resp = await fetch(`/api/workflows/${encodeURIComponent(id)}`);
+  const resp = await fetch(wfUrl(`/${encodeURIComponent(id)}`));
   if (!resp.ok) { status(`找不到工作流 ${id}`, 'warn'); return; }
   const graph = await resp.json();
 
@@ -402,6 +426,7 @@ async function loadWorkflow(id) {
   state.editor.import(toDrawflow(graph, nodeHtml));
   selectNode(null);
   fitView();
+  state.dirty = false;
   updateIsolationHint();
   status(`已載入「${state.workflowName}」`, 'ok');
   validate();
@@ -415,7 +440,7 @@ async function save({ asNew = false } = {}) {
   // 而且範本被蓋掉之後不會自動還原（seeder 只在 db 裡沒有該 id 時才匯入）。
   if (asNew) delete graph.id;
 
-  const resp = await fetch('/api/workflows', {
+  const resp = await fetch(wfUrl(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(graph),
@@ -424,6 +449,7 @@ async function save({ asNew = false } = {}) {
   if (!resp.ok) { status(body.error, 'bad'); return; }
 
   state.workflowId = body.id;
+  state.dirty = false;
   await loadWorkflowList();
   $('#wf-list').value = body.id;
   const what = asNew ? '已另存為新的工作流' : '已儲存';
@@ -441,6 +467,7 @@ function newWorkflow() {
   $('#wf-name').value = state.workflowName;
   $('#wf-list').value = '';
   $('#wf-isolation').value = 'shared';
+  state.dirty = false;
   selectNode(null);
   updateIsolationHint();
   showProblems(['空的工作流：從左邊拖一個「需求」節點開始。']);
@@ -452,12 +479,11 @@ async function deleteWorkflow() {
   const name = $('#wf-name').value || state.workflowId;
   if (!confirm(`確定要刪除「${name}」？\n\n（隨附的範本刪掉之後，下次啟動服務會從 workflows/ 目錄重新匯入。）`)) return;
 
-  const resp = await fetch(`/api/workflows/${encodeURIComponent(state.workflowId)}`,
+  const resp = await fetch(wfUrl(`/${encodeURIComponent(state.workflowId)}`),
                            { method: 'DELETE' });
   if (!resp.ok) { status('刪除失敗', 'bad'); return; }
-  await loadWorkflowList();
-  const first = $('#wf-list').options[0];
-  if (first) await loadWorkflow(first.value);
+  const ids = await loadWorkflowList();
+  if (ids.length) await loadWorkflow(ids[0]);
   else newWorkflow();
   status(`已刪除「${name}」`, 'ok');
 }
@@ -484,17 +510,20 @@ function showProblems(problems) {
 async function run() {
   if (!(await validate())) { status('先修掉上面的問題再執行', 'bad'); return; }
   const requirement = $('#requirement').value.trim();
-  const resp = await fetch('/api/runs', {
+  const resp = await fetch(`/api/projects/${encodeURIComponent(state.project.id)}/runs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ graph: currentGraph(), requirement }),
   });
   const body = await resp.json();
   if (!resp.ok) { status(body.error, 'bad'); return; }
-  location.href = `/runs/${body.run_id}`;
+  // 這次執行用的是畫布上的即時內容，run 已經把它整份存成快照了
+  state.leaving = true;
+  location.href = `/projects/${encodeURIComponent(state.project.id)}/runs/${body.run_id}`;
 }
 
 function markDirty() {
+  state.dirty = true;
   status('未儲存的變更', 'warn');
   updateIsolationHint();
   clearTimeout(markDirty._t);
@@ -519,16 +548,7 @@ function esc(s) {
 $('#btn-new').addEventListener('click', newWorkflow);
 $('#btn-save-as').addEventListener('click', () => save({ asNew: true }));
 $('#btn-delete').addEventListener('click', deleteWorkflow);
-$('#btn-save').addEventListener('click', () => {
-  // 覆蓋隨附範本是不可逆的（seeder 只在 db 裡沒有該 id 時才匯入），先問一次
-  if (SHIPPED.has(state.workflowId)
-      && !confirm(`「${$('#wf-name').value}」是隨附的範本。\n`
-                  + '直接儲存會覆蓋它，而且不會自動還原。\n\n'
-                  + '要保留原本的範本，請改按「另存新檔」。\n\n仍要覆蓋嗎？')) {
-    return;
-  }
-  save();
-});
+$('#btn-save').addEventListener('click', () => save());
 $('#btn-run').addEventListener('click', run);
 $('#btn-validate').addEventListener('click', validate);
 $('#wf-list').addEventListener('change', (e) => loadWorkflow(e.target.value));

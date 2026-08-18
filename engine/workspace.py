@@ -97,6 +97,24 @@ def validate_project_repo(project_repo: Path, tool_root: Path | None = None) -> 
     return toplevel
 
 
+def detect_main_branch(repo: Path, fallback: str = "main") -> str:
+    """猜這個 repo 的主線分支名稱。
+
+    每個專案的慣例不一樣（main / master / develop）。註冊專案時猜一次寫進
+    project.yaml，比讓每個人事後發現「跑錯基準分支」再回去改好得多。
+
+    順序：origin/HEAD 指向誰 → 目前 checkout 的分支 → fallback。
+    """
+    proc = _git(
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=repo, check=False
+    )
+    if proc.returncode == 0 and "/" in proc.stdout:
+        return proc.stdout.strip().split("/", 1)[1]
+
+    current = _git(["branch", "--show-current"], cwd=repo, check=False).stdout.strip()
+    return current or fallback
+
+
 def resolve_start_point(repo: Path, main_branch: str) -> str:
     """決定 worktree 的起始點。
 

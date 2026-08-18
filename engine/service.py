@@ -26,6 +26,7 @@ from engine.isolation import (
     SharedIsolation,
     parse_mode,
 )
+from engine.project import ProjectSettings
 from engine.runner import CANCELLED, FAILED, PASSED, Runner
 from engine.workspace import (
     Workspace,
@@ -35,6 +36,8 @@ from engine.workspace import (
 )
 from settings import Settings
 from store.db import Store
+from store.projects import ProjectRegistry
+from store.stores import StoreRegistry
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,6 +50,8 @@ class ServiceError(Exception):
 class RunHandle:
     run_id: str
     bus: RunBus
+    project: ProjectSettings
+    store: Store
     cancel: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
     workspace: Workspace | None = None
@@ -58,9 +63,22 @@ class RunHandle:
 
 
 class RunService:
-    def __init__(self, settings: Settings, store: Store, registry: Registry) -> None:
+    """跑 run。每個 run 綁在一個專案上。
+
+    工具層的 Settings 只剩「這台機器的預設」；真正決定「在哪個 repo 上動手、
+    用哪個基準分支、worktree 開在哪、產物寫到哪」的是傳進來的 ProjectSettings。
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        stores: StoreRegistry,
+        projects: ProjectRegistry,
+        registry: Registry,
+    ) -> None:
         self.settings = settings
-        self.store = store
+        self.stores = stores
+        self.projects = projects
         self.registry = registry
         self._runs: dict[str, RunHandle] = {}
         self._lock = threading.Lock()
@@ -70,11 +88,23 @@ class RunService:
         """服務重啟後，狀態卡在 running 的 run 其實已經沒有執行緒在跑了。
 
         不標記的話 UI 會永遠顯示「執行中」，使用者等一個不存在的東西。
+
+        每個專案各有一個資料庫，所以要掃過全部 —— 漏掉一個，那個專案的
+        run 就會永遠顯示執行中。一個專案讀不到（資料夾被搬走）不該讓
+        其他專案跟著漏掉，所以每個都各自 try。
         """
-        for run_id in self.store.unfinished_runs():
-            self.store.finish_run(
-                run_id, FAILED, "服務重新啟動，這個 run 的執行緒已不存在", 0
-            )
+        from engine.project import ProjectError, for_project
+
+        for entry in self.projects.list():
+            try:
+                project = for_project(self.settings, entry.id, entry.path, entry.name)
+                store = self.stores.for_project(project)
+            except (ProjectError, FileNotFoundError, OSError):
+                continue
+            for run_id in store.unfinished_runs():
+                store.finish_run(
+                    run_id, FAILED, "服務重新啟動，這個 run 的執行緒已不存在", 0
+                )
 
     # ------------------------------------------------------------ 查詢
 
@@ -82,12 +112,15 @@ class RunService:
         with self._lock:
             return self._runs.get(run_id)
 
-    def bus_for(self, run_id: str) -> RunBus:
-        """取得 bus；已結束的 run 回一個只能回放 db 的 bus。"""
+    def bus_for(self, project: ProjectSettings, run_id: str) -> RunBus:
+        """取得 bus；已結束的 run 回一個只能回放 db 的 bus。
+
+        要帶 project：run 的事件存在該專案自己的資料庫裡，回放得知道去哪讀。
+        """
         existing = self.handle(run_id)
         if existing:
             return existing.bus
-        bus = RunBus(self.store, run_id)
+        bus = RunBus(self.stores.for_project(project), run_id)
         bus.close()  # 沒有活著的執行緒，回放完就收尾
         return bus
 
@@ -99,6 +132,7 @@ class RunService:
 
     def start(
         self,
+        project: ProjectSettings,
         graph_dict: dict[str, Any],
         requirement: str,
         workflow_id: str | None = None,
@@ -116,12 +150,18 @@ class RunService:
             from engine.workspace import validate_project_repo
 
             try:
-                validate_project_repo(self.settings.project_repo, tool_root=ROOT)
+                validate_project_repo(project.repo, tool_root=ROOT)
             except WorkspaceError as exc:
                 raise ServiceError(str(exc)) from exc
 
-        run_id = self.store.create_run(graph_dict, requirement, workflow_id)
-        handle = RunHandle(run_id=run_id, bus=RunBus(self.store, run_id))
+        store = self.stores.for_project(project)
+        run_id = store.create_run(
+            graph_dict, requirement, workflow_id,
+            project_id=project.id, project_path=str(project.repo),
+        )
+        handle = RunHandle(
+            run_id=run_id, bus=RunBus(store, run_id), project=project, store=store
+        )
         with self._lock:
             self._runs[run_id] = handle
 
@@ -149,9 +189,11 @@ class RunService:
         def emit_raw(kind: str, text: str, **data: Any) -> None:
             handle.bus.publish("", {"kind": kind, "text": text, "data": data})
 
+        project = handle.project
+        store = handle.store
         workspace: Workspace | None = None
         isolation: Isolation | None = None
-        artifacts = self.settings.runs_dir / run_id / "artifacts"
+        artifacts = project.runs_dir / run_id / "artifacts"
         mode = parse_mode(graph.settings)
 
         try:
@@ -159,26 +201,26 @@ class RunService:
                 # 刻意不開 run 層級的 worktree：task/<run-id> 必須保持沒有被
                 # 任何 worktree 佔用，否則跑完之後移動它會被 git 拒絕。
                 run_base = prepare_run_base(
-                    project_repo=self.settings.project_repo,
-                    main_branch=self.settings.main_branch,
+                    project_repo=project.repo,
+                    main_branch=project.main_branch,
                     run_id=run_id,
                     tool_root=ROOT,
                 )
                 repo, branch = run_base.repo, run_base.branch
                 base_sha, start_point = run_base.base_sha, run_base.start_point
-                workdir = str(self.settings.worktree_root / run_id)
+                workdir = str(project.worktree_root / run_id)
                 isolation = PerNodeIsolation(
                     repo=repo,
-                    worktree_root=self.settings.worktree_root,
+                    worktree_root=project.worktree_root,
                     run_id=run_id,
                     run_base_sha=base_sha,
                     tool_root=ROOT,
                 )
             else:
                 workspace = create_workspace(
-                    project_repo=self.settings.project_repo,
-                    worktree_root=self.settings.worktree_root,
-                    main_branch=self.settings.main_branch,
+                    project_repo=project.repo,
+                    worktree_root=project.worktree_root,
+                    main_branch=project.main_branch,
                     run_id=run_id,
                     tool_root=ROOT,
                 )
@@ -188,12 +230,17 @@ class RunService:
                 workdir = str(workspace.path)
                 isolation = SharedIsolation(workspace=workspace)
 
-            self.store.start_run(run_id, branch, base_sha, workdir)
+            store.start_run(run_id, branch, base_sha, workdir)
             emit_raw(
                 STATUS,
+                # 專案名稱與 repo 路徑放在第一句：多專案之後，「這次到底跑在
+                # 哪個資料夾上」是看事件流的人最先要確認的事。
+                f"專案 {project.name}（{project.repo}）｜"
                 f"{'每節點各自的 worktree 會建在' if mode == PER_NODE else 'worktree 就緒:'}"
                 f" {workdir}（branch {branch}，基準 {start_point}，隔離模式 {mode}）",
                 phase="run_start",
+                project=project.id,
+                repo=str(project.repo),
                 branch=branch,
                 worktree=workdir,
                 isolation=mode,
@@ -214,7 +261,7 @@ class RunService:
                 context=ctx,
                 isolation=isolation,
                 registry=self.registry,
-                guards=self.settings.guards,
+                guards=project.guards,
                 emit=handle.bus.publish,
                 artifacts_dir=artifacts,
                 cancel=handle.cancel,
@@ -241,8 +288,8 @@ class RunService:
                             phase="run_branch", branch=branch, commit=final,
                         )
 
-            self._persist_nodes(run_id, graph, ctx, result)
-            self.store.finish_run(run_id, result.status, result.reason, result.steps)
+            self._persist_nodes(store, run_id, graph, ctx, result)
+            store.finish_run(run_id, result.status, result.reason, result.steps)
 
             if result.status == PASSED:
                 emit_raw(
@@ -263,17 +310,17 @@ class RunService:
                     reason=result.reason,
                 )
 
-            if result.status == PASSED and self.settings.cleanup_worktree_on_success:
+            if result.status == PASSED and project.cleanup_worktree_on_success:
                 # per_node 模式會留下 N 個 worktree，全部要收掉
                 if isolation is not None:
                     isolation.cleanup()
 
         except WorkspaceError as exc:
-            self.store.finish_run(run_id, FAILED, str(exc), 0)
+            store.finish_run(run_id, FAILED, str(exc), 0)
             emit_raw(ERROR, str(exc), phase="run_end", status=FAILED)
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {exc}"
-            self.store.finish_run(run_id, FAILED, detail, 0)
+            store.finish_run(run_id, FAILED, detail, 0)
             emit_raw(
                 ERROR,
                 detail,
@@ -283,14 +330,16 @@ class RunService:
             )
         finally:
             handle.bus.close()
-            self.store.close()
+            self.stores.close_current_thread()
             with self._lock:
                 self._runs.pop(run_id, None)
 
-    def _persist_nodes(self, run_id, graph: g.Graph, ctx: RunContext, result) -> None:
+    def _persist_nodes(
+        self, store: Store, run_id, graph: g.Graph, ctx: RunContext, result
+    ) -> None:
         for node_id, node in graph.nodes.items():
             out = ctx.nodes.get(node_id)
-            self.store.save_node_run(
+            store.save_node_run(
                 run_id,
                 node_id,
                 label=node.label,

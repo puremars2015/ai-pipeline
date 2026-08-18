@@ -23,23 +23,30 @@ from flask import Flask, Response, jsonify, render_template, request
 import settings
 from adapters.registry import Registry
 from engine import graph as g
+from engine import project as proj
 from engine.service import RunService, ServiceError
-from engine.workspace import WorkspaceError, validate_project_repo
-from store.db import Store
+from engine.workspace import WorkspaceError, detect_main_branch, validate_project_repo
+from store import templates
+from store.projects import Project, ProjectRegistry
+from store.stores import StoreRegistry, merge_runs
+from store.workflows import WorkflowError, WorkflowStore
 
 ROOT = Path(__file__).resolve().parent
-WORKFLOW_DIR = ROOT / "workflows"
 
 
 def create_app(config_path: Path | None = None) -> Flask:
     app = Flask(__name__)
     cfg = settings.load(config_path)
-    store = Store(cfg.database)
     registry = Registry()
-    service = RunService(cfg, store, registry)
+    # 中央資料庫現在只剩專案清單；執行紀錄各自住在專案的 local/ 底下。
+    projects = ProjectRegistry(cfg.database)
+    stores = StoreRegistry()
+    service = RunService(cfg, stores, projects, registry)
 
-    app.config.update(SETTINGS=cfg, STORE=store, REGISTRY=registry, SERVICE=service)
-    _seed_workflows(store)
+    app.config.update(
+        SETTINGS=cfg, REGISTRY=registry, SERVICE=service,
+        PROJECTS=projects, STORES=stores,
+    )
 
     # ------------------------------------------------------------ 頁面
 
@@ -51,24 +58,23 @@ def create_app(config_path: Path | None = None) -> Flask:
     def runs_page():
         return render_template("runs.html")
 
-    @app.get("/runs/<run_id>")
-    def run_page(run_id: str):
-        return render_template("run_detail.html", run_id=run_id)
+    @app.get("/projects/<pid>/runs/<run_id>")
+    def run_page(pid: str, run_id: str):
+        return render_template("run_detail.html", run_id=run_id, project_id=pid)
 
     # ------------------------------------------------------------ 基本
 
     @app.get("/api/health")
     def health():
-        try:
-            repo = validate_project_repo(cfg.project_repo, tool_root=ROOT)
-            repo_status = {"ok": True, "path": str(repo)}
-        except WorkspaceError as exc:
-            repo_status = {"ok": False, "error": str(exc)}
+        """工具層的健康狀態。
+
+        不再回報單一的目標 repo —— 那個概念已經被專案清單取代。
+        個別專案好不好是 /api/projects 的事（那裡每筆都會重算）。
+        """
         return jsonify(
             {
                 "ok": True,
-                "project_repo": repo_status,
-                "main_branch": cfg.main_branch,
+                "projects": len(projects.list()),
                 "adapters_installed": registry.availability(),
             }
         )
@@ -102,35 +108,192 @@ def create_app(config_path: Path | None = None) -> Flask:
         ]
         return jsonify({"adapters": items, "builtins": _builtin_specs()})
 
+    # -------------------------------------------------------- projects
+
+    def _project_payload(entry: Project) -> dict:
+        """一筆專案 + 它現在的健康狀態。
+
+        健康狀態每次都重算而不是註冊時存起來 —— 專案資料夾會被搬走、
+        刪掉、或 checkout 成另一個狀態，存下來的答案很快就是錯的。
+        """
+        payload = {
+            "id": entry.id,
+            "path": str(entry.path),
+            "name": entry.name,
+            "added_at": entry.added_at,
+            "last_used_at": entry.last_used_at,
+            "initialised": proj.is_initialised(entry.path),
+        }
+        try:
+            validate_project_repo(entry.path, tool_root=ROOT)
+            resolved = proj.for_project(cfg, entry.id, entry.path, entry.name)
+        except (WorkspaceError, proj.ProjectError) as exc:
+            return payload | {"ok": False, "error": str(exc)}
+
+        return payload | {
+            "ok": True,
+            "name": resolved.name,
+            "main_branch": resolved.main_branch,
+            "isolation": resolved.isolation,
+            "worktree_root": str(resolved.worktree_root),
+            "workflows_dir": str(resolved.workflows_dir),
+        }
+
+    @app.get("/api/projects")
+    def list_projects():
+        return jsonify({"projects": [_project_payload(p) for p in projects.list()]})
+
+    @app.post("/api/projects")
+    def add_project():
+        """註冊一個專案：驗證 → 初始化 .ai-workflow-proj/ → 記進清單。
+
+        三步驟的順序不能換。前兩步都可能失敗，而失敗時絕不能在清單裡
+        留下一筆指向壞掉路徑的紀錄。
+        """
+        payload = request.get_json(silent=True) or {}
+        raw_path = (payload.get("path") or "").strip()
+        if not raw_path:
+            return jsonify({"error": "需要專案路徑"}), 400
+
+        try:
+            repo = validate_project_repo(
+                settings.resolve_path(raw_path), tool_root=ROOT
+            )
+        except WorkspaceError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        existing = projects.get_by_path(repo)
+        if existing:
+            return jsonify(
+                {"error": f"這個專案已經在清單裡了（{existing.id}）", "id": existing.id}
+            ), 409
+
+        name = (payload.get("name") or "").strip() or repo.name
+        try:
+            proj.scaffold(
+                repo, name=name, main_branch=detect_main_branch(repo, cfg.main_branch)
+            )
+        except (proj.ProjectError, OSError) as exc:
+            return jsonify({"error": f"無法建立 {proj.DIR_NAME}/: {exc}"}), 400
+
+        return jsonify(_project_payload(projects.add(repo, name=name))), 201
+
+    @app.get("/api/projects/<pid>")
+    def get_project(pid: str):
+        entry = projects.get(pid)
+        if not entry:
+            return jsonify({"error": f"找不到專案: {pid}"}), 404
+        return jsonify(_project_payload(entry))
+
+    @app.delete("/api/projects/<pid>")
+    def remove_project(pid: str):
+        """只從清單移除，不刪任何檔案。
+
+        .ai-workflow-proj/ 裡是已經 commit 進使用者 git 的工作流定義，
+        以及他們的執行紀錄。這個 API 沒有立場刪它們。
+        """
+        if not projects.remove(pid):
+            return jsonify({"error": f"找不到專案: {pid}"}), 404
+        return jsonify({"ok": True, "note": f"已從清單移除，{proj.DIR_NAME}/ 保持原樣"})
+
     # ------------------------------------------------------- workflows
 
-    @app.get("/api/workflows")
-    def list_workflows():
-        return jsonify({"workflows": store.list_workflows()})
+    def _resolve_project(pid: str):
+        """pid → (設定, 工作流資料夾, 紀錄資料庫)。失敗時回 (None, 錯誤回應)。
 
-    @app.get("/api/workflows/<wf_id>")
-    def get_workflow(wf_id: str):
-        found = store.get_workflow(wf_id)
-        if not found:
+        每個 project-scoped 的路由都從這裡開始，所以「專案不存在」與
+        「專案資料夾壞掉了」只會有一種錯誤訊息與一個狀態碼。
+        """
+        entry = projects.get(pid)
+        if not entry:
+            return None, (jsonify({"error": f"找不到專案: {pid}"}), 404)
+        try:
+            resolved = proj.for_project(cfg, entry.id, entry.path, entry.name)
+            store = stores.for_project(resolved)
+        except proj.ProjectError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
+        except (FileNotFoundError, OSError) as exc:
+            return None, (jsonify({"error": f"專案資料夾無法使用: {exc}"}), 409)
+        return (resolved, WorkflowStore(resolved.workflows_dir), store), None
+
+    @app.get("/api/projects/<pid>/workflows")
+    def list_workflows(pid: str):
+        found, err = _resolve_project(pid)
+        if err:
+            return err
+        return jsonify({"workflows": found[1].list()})
+
+    @app.get("/api/projects/<pid>/workflows/<wf_id>")
+    def get_workflow(pid: str, wf_id: str):
+        found, err = _resolve_project(pid)
+        if err:
+            return err
+        try:
+            graph = found[1].get(wf_id)
+        except WorkflowError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not graph:
             return jsonify({"error": f"找不到工作流: {wf_id}"}), 404
-        return jsonify(found)
+        return jsonify(graph)
 
-    @app.post("/api/workflows")
-    def save_workflow():
+    @app.post("/api/projects/<pid>/workflows")
+    def save_workflow(pid: str):
+        found, err = _resolve_project(pid)
+        if err:
+            return err
         payload = request.get_json(silent=True) or {}
         try:
             graph = g.parse(payload)
         except g.GraphError as exc:
             return jsonify({"error": str(exc)}), 400
+
         problems = g.validate(graph, [s.id for s in registry.all()])
-        wf_id = store.save_workflow(g.to_dict(graph) | {"name": graph.name or "未命名"})
+        try:
+            wf_id = found[1].save(
+                g.to_dict(graph) | {"name": graph.name or "未命名"}
+            )
+        except (WorkflowError, OSError) as exc:
+            return jsonify({"error": f"寫入失敗: {exc}"}), 400
         return jsonify({"id": wf_id, "problems": problems})
 
-    @app.delete("/api/workflows/<wf_id>")
-    def delete_workflow(wf_id: str):
-        if not store.delete_workflow(wf_id):
+    @app.delete("/api/projects/<pid>/workflows/<wf_id>")
+    def delete_workflow(pid: str, wf_id: str):
+        found, err = _resolve_project(pid)
+        if err:
+            return err
+        try:
+            removed = found[1].delete(wf_id)
+        except WorkflowError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not removed:
             return jsonify({"error": "找不到工作流"}), 404
         return jsonify({"ok": True})
+
+    @app.get("/api/templates")
+    def list_templates():
+        """隨附範本。新專案的 workflows/ 是空的，得有個起點。"""
+        return jsonify({"templates": templates.list_templates()})
+
+    @app.post("/api/projects/<pid>/workflows/import/<template_id>")
+    def import_template(pid: str, template_id: str):
+        """把一個範本複製進這個專案。複製完就是專案自己的檔案。"""
+        found, err = _resolve_project(pid)
+        if err:
+            return err
+        payload = templates.load_template(template_id)
+        if payload is None:
+            return jsonify({"error": f"找不到範本: {template_id}"}), 404
+
+        try:
+            g.parse(payload)
+        except g.GraphError as exc:
+            return jsonify({"error": f"範本本身有問題: {exc}"}), 500
+
+        # 已經有同名的就配一個新 id，不要默默蓋掉使用者調過的版本
+        store_ = found[1]
+        if store_.exists(template_id):
+            payload = {**payload, "id": store_.new_id(template_id)}
+        return jsonify({"id": store_.save(payload)}), 201
 
     @app.post("/api/workflows/validate")
     def validate_workflow():
@@ -143,81 +306,148 @@ def create_app(config_path: Path | None = None) -> Flask:
         return jsonify({"ok": not problems, "problems": problems})
 
     # ------------------------------------------------------------- runs
+    #
+    # run 的路由全部掛在專案底下。執行紀錄存在該專案自己的資料庫裡
+    # （.ai-workflow-proj/local/ai-workflow.sqlite），光有 run id 是查不到的 ——
+    # 得先知道去哪個資料庫找。這也讓「拿 A 專案的設定去查 B 專案的 run」
+    # 在結構上就不可能發生。
 
-    @app.post("/api/runs")
-    def start_run():
+    @app.post("/api/projects/<pid>/runs")
+    def start_run(pid: str):
+        """在這個專案的 repo 上跑一個工作流。"""
+        found, err = _resolve_project(pid)
+        if err:
+            return err
+        project, workflows, _ = found
+
         payload = request.get_json(silent=True) or {}
         requirement = (payload.get("requirement") or "").strip()
 
         graph_dict = payload.get("graph")
         workflow_id = payload.get("workflow_id")
         if graph_dict is None and workflow_id:
-            graph_dict = store.get_workflow(workflow_id)
+            try:
+                graph_dict = workflows.get(workflow_id)
+            except WorkflowError as exc:
+                return jsonify({"error": str(exc)}), 400
             if graph_dict is None:
                 return jsonify({"error": f"找不到工作流: {workflow_id}"}), 404
         if graph_dict is None:
             return jsonify({"error": "需要 graph 或 workflow_id"}), 400
 
         try:
-            run_id = service.start(graph_dict, requirement, workflow_id)
+            run_id = service.start(project, graph_dict, requirement, workflow_id)
         except (ServiceError, g.GraphError) as exc:
             return jsonify({"error": str(exc)}), 400
+        projects.touch(pid)
         return jsonify({"run_id": run_id}), 201
 
-    @app.get("/api/runs")
-    def list_runs():
+    @app.get("/api/projects/<pid>/runs")
+    def list_project_runs(pid: str):
+        found, err = _resolve_project(pid)
+        if err:
+            return err
         limit = min(int(request.args.get("limit", 50)), 200)
-        items = store.list_runs(limit)
+        items = found[2].list_runs(limit)
         for item in items:
             item["active"] = service.is_active(item["id"])
         return jsonify({"runs": items})
 
-    @app.get("/api/runs/<run_id>")
-    def get_run(run_id: str):
-        found = store.get_run(run_id)
-        if not found:
-            return jsonify({"error": f"找不到 run: {run_id}"}), 404
-        found["active"] = service.is_active(run_id)
-        return jsonify(found)
+    @app.get("/api/runs")
+    def list_all_runs():
+        """跨專案總覽：把每個專案的資料庫各查一次再合併。
 
-    @app.get("/api/runs/<run_id>/diff")
-    def run_diff(run_id: str):
+        專案數是使用者手動註冊的（個位數），直接查完合併就好 —— 另外維護
+        一份索引表只會多出「索引跟真實資料不同步」這種問題。
+        讀不到的專案（資料夾被搬走）跳過，不能讓總覽整個開不起來。
+        """
+        limit = min(int(request.args.get("limit", 50)), 200)
+        openable = []
+        for entry in projects.list():
+            try:
+                resolved = proj.for_project(cfg, entry.id, entry.path, entry.name)
+                openable.append((entry.id, stores.for_project(resolved)))
+            except (proj.ProjectError, FileNotFoundError, OSError):
+                continue
+
+        items = merge_runs(openable, limit)
+        for item in items:
+            item["active"] = service.is_active(item["id"])
+        return jsonify({"runs": items})
+
+    def _load_run(pid: str, run_id: str):
+        """(專案, run) 或錯誤回應。"""
+        found, err = _resolve_project(pid)
+        if err:
+            return None, err
+        run = found[2].get_run(run_id)
+        if not run:
+            return None, (jsonify({"error": f"找不到 run: {run_id}"}), 404)
+        return (found[0], run, found[2]), None
+
+    @app.get("/api/projects/<pid>/runs/<run_id>")
+    def get_run(pid: str, run_id: str):
+        loaded, err = _load_run(pid, run_id)
+        if err:
+            return err
+        run = loaded[1]
+        run["active"] = service.is_active(run_id)
+        return jsonify(run)
+
+    @app.get("/api/projects/<pid>/runs/<run_id>/diff")
+    def run_diff(pid: str, run_id: str):
         """這個 run 產生的變更。
 
         從 branch 算而不是從 worktree 算 —— worktree 可能已經清掉了，但 branch
         一定還在（要留給人工檢查與合併）。
         """
-        found = store.get_run(run_id)
-        if not found:
-            return jsonify({"error": "找不到 run"}), 404
-        if not found["branch"] or not found["base_sha"]:
+        loaded, err = _load_run(pid, run_id)
+        if err:
+            return err
+        project, run, _ = loaded
+        if not run["branch"] or not run["base_sha"]:
             return jsonify({"diff": "", "files": [], "note": "這個 run 沒有建立 branch"})
+
+        # 用這個 run 自己記下的 repo，不是「目前作用中的專案」——
+        # 拿錯 repo 的話 git 只會回非零然後我們給出一份空 diff，
+        # 看起來就像「這次沒有任何變更」，是最難查的那種錯。
+        repo_path = run.get("project_path") or str(project.repo)
+        if not Path(repo_path).is_dir():
+            return jsonify({"error": f"專案資料夾已不存在: {repo_path}"}), 409
 
         import subprocess
 
         def git(*args: str) -> str:
             proc = subprocess.run(
-                ["git", *args], cwd=str(cfg.project_repo),
-                capture_output=True, text=True,
+                ["git", *args], cwd=repo_path, capture_output=True, text=True,
             )
             return proc.stdout if proc.returncode == 0 else ""
 
-        rng = f"{found['base_sha']}..{found['branch']}"
+        rng = f"{run['base_sha']}..{run['branch']}"
         return jsonify(
             {
                 "diff": git("diff", rng)[:400_000],  # 別把整個瀏覽器塞爆
                 "files": [f for f in git("diff", "--name-only", rng).splitlines() if f],
                 "stat": git("diff", "--stat", rng),
                 "log": git("log", "--oneline", rng),
-                "branch": found["branch"],
-                "merge_command": f"git merge --no-ff {found['branch']}",
+                "branch": run["branch"],
+                "merge_command": f"git merge --no-ff {run['branch']}",
             }
         )
 
-    @app.get("/api/runs/<run_id>/artifacts")
-    def run_artifacts(run_id: str):
-        """節點產物（QA 的結構化輸出、schema 等），存在 repo 之外。"""
-        base = cfg.runs_dir / run_id / "artifacts"
+    @app.get("/api/projects/<pid>/runs/<run_id>/artifacts")
+    def run_artifacts(pid: str, run_id: str):
+        """節點產物（QA 的結構化輸出、schema 等）。
+
+        存在專案的 .ai-workflow-proj/local/ 底下 —— 跟著專案走，但被
+        .gitignore 擋住，不會被 merge 進 main。
+        """
+        loaded, err = _load_run(pid, run_id)
+        if err:
+            return err
+        project = loaded[0]
+
+        base = project.runs_dir / run_id / "artifacts"
         if not base.exists():
             return jsonify({"artifacts": []})
         items = []
@@ -233,19 +463,22 @@ def create_app(config_path: Path | None = None) -> Flask:
             )
         return jsonify({"artifacts": items})
 
-    @app.post("/api/runs/<run_id>/cancel")
-    def cancel_run(run_id: str):
-        if not store.get_run(run_id):
-            return jsonify({"error": "找不到 run"}), 404
+    @app.post("/api/projects/<pid>/runs/<run_id>/cancel")
+    def cancel_run(pid: str, run_id: str):
+        loaded, err = _load_run(pid, run_id)
+        if err:
+            return err
         if not service.cancel(run_id):
             return jsonify({"ok": False, "reason": "這個 run 已經結束了"}), 409
         return jsonify({"ok": True})
 
-    @app.get("/api/runs/<run_id>/events")
-    def run_events(run_id: str):
+    @app.get("/api/projects/<pid>/runs/<run_id>/events")
+    def run_events(pid: str, run_id: str):
         """SSE 串流。斷線重連時用 Last-Event-ID 或 ?after= 從 db 補回漏掉的。"""
-        if not store.get_run(run_id):
-            return jsonify({"error": "找不到 run"}), 404
+        loaded, err = _load_run(pid, run_id)
+        if err:
+            return err
+        project, _, store = loaded
 
         after = request.headers.get("Last-Event-ID") or request.args.get("after") or "0"
         try:
@@ -253,7 +486,7 @@ def create_app(config_path: Path | None = None) -> Flask:
         except ValueError:
             after_seq = 0
 
-        bus = service.bus_for(run_id)
+        bus = service.bus_for(project, run_id)
 
         def generate():
             # 先送一則註解，讓瀏覽器立刻確立連線
@@ -337,18 +570,6 @@ def _builtin_specs() -> list[dict]:
             ],
         },
     ]
-
-
-def _seed_workflows(store: Store) -> None:
-    """把 workflows/*.json 匯入 db（同 id 就更新）。"""
-    for path in sorted(WORKFLOW_DIR.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text("utf-8"))
-            g.parse(payload)  # 壞掉的範本不要塞進 db
-        except (json.JSONDecodeError, g.GraphError):
-            continue
-        if not store.get_workflow(payload.get("id", "")):
-            store.save_workflow(payload)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,20 @@
 {% block title %}執行紀錄{% endblock %}
 {% block content %}
 <div class="p-4">
-  <h2 class="mb-3 text-lg font-semibold">執行紀錄</h2>
+  <div class="mb-3 flex items-center gap-3">
+    <h2 class="text-lg font-semibold">執行紀錄</h2>
+    <label class="flex items-center gap-1.5 text-xs text-slate-400">
+      <input id="all-projects" type="checkbox" class="accent-sky-600">
+      顯示所有專案
+    </label>
+  </div>
   <div id="runs" class="text-sm text-slate-400">載入中…</div>
 </div>
 {% endblock %}
 {% block scripts %}
-<script>
+<script type="module">
+import { fetchProjects, activeProject, esc } from "{{ url_for('static', filename='js/project.js') }}";
+
 const BADGE = {
   passed: 'bg-emerald-500/15 text-emerald-300',
   failed: 'bg-rose-500/15 text-rose-300',
@@ -16,22 +24,42 @@ const BADGE = {
   queued: 'bg-amber-500/15 text-amber-300',
 };
 
-fetch('/api/runs').then(r => r.json()).then(({ runs }) => {
+const projects = await fetchProjects();
+const active = await activeProject();
+const names = new Map(projects.map((p) => [p.id, p.name]));
+
+async function render() {
   const host = document.getElementById('runs');
+  // 預設只看目前的專案。跨專案總覽是刻意的次要視角 —— 平常你在意的是
+  // 「我這個專案跑得怎樣」，混在一起反而找不到東西。
+  const all = document.getElementById('all-projects').checked;
+  const url = !all && active
+    ? `/api/projects/${encodeURIComponent(active.id)}/runs`
+    : '/api/runs';
+  const { runs } = await fetch(url).then((r) => r.json());
+
   if (!runs.length) {
-    host.textContent = '還沒有任何執行紀錄。';
+    host.textContent = all || !active
+      ? '還沒有任何執行紀錄。'
+      : `「${active.name}」還沒有執行紀錄。`;
     return;
   }
-  host.innerHTML = runs.map(r => `
-    <a href="/runs/${r.id}" class="mb-2 block rounded border border-slate-700 p-3 hover:border-slate-500">
+  host.innerHTML = runs.map((r) => `
+    <a href="/projects/${encodeURIComponent(r.project_id || (active && active.id) || '')}/runs/${r.id}" class="mb-2 block rounded border border-slate-700 p-3 hover:border-slate-500">
       <div class="flex items-center gap-3">
-        <span class="rounded px-2 py-0.5 text-xs ${BADGE[r.status] || ''}">${r.status}</span>
-        <span class="font-mono text-xs text-slate-500">${r.id}</span>
-        <span class="text-slate-300">${r.workflow_name || ''}</span>
+        <span class="rounded px-2 py-0.5 text-xs ${BADGE[r.status] || ''}">${esc(r.status)}</span>
+        <span class="font-mono text-xs text-slate-500">${esc(r.id)}</span>
+        <span class="text-slate-300">${esc(r.workflow_name || '')}</span>
+        ${all && r.project_id
+          ? `<span class="ml-auto text-xs text-slate-500">${esc(names.get(r.project_id) || r.project_id)}</span>`
+          : ''}
       </div>
-      <div class="mt-1 truncate text-slate-400">${r.requirement || '(沒有需求文字)'}</div>
-      ${r.reason ? `<div class="mt-1 text-xs text-amber-400">${r.reason}</div>` : ''}
+      <div class="mt-1 truncate text-slate-400">${esc(r.requirement || '(沒有需求文字)')}</div>
+      ${r.reason ? `<div class="mt-1 text-xs text-amber-400">${esc(r.reason)}</div>` : ''}
     </a>`).join('');
-});
+}
+
+document.getElementById('all-projects').addEventListener('change', render);
+await render();
 </script>
 {% endblock %}

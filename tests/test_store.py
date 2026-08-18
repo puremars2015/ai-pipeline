@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -25,20 +26,6 @@ def test_new_id_is_sortable_and_unique():
     ids = [new_id("run") for _ in range(50)]
     assert len(set(ids)) == 50
     assert all(i.startswith("run-") for i in ids)
-
-
-def test_workflow_crud(store):
-    wf_id = store.save_workflow(GRAPH)
-    assert store.get_workflow(wf_id)["name"] == "測試流程"
-    assert [w["id"] for w in store.list_workflows()] == [wf_id]
-
-    store.save_workflow({**GRAPH, "id": wf_id, "name": "改名了"})
-    assert store.get_workflow(wf_id)["name"] == "改名了"
-    assert len(store.list_workflows()) == 1, "同 id 應該是更新不是新增"
-
-    assert store.delete_workflow(wf_id)
-    assert store.get_workflow(wf_id) is None
-    assert not store.delete_workflow(wf_id)
 
 
 def test_run_lifecycle(store):
@@ -71,16 +58,62 @@ def test_requirement_is_immutable_snapshot(store):
     assert store.get_run(run_id)["requirement"] == "原始需求"
 
 
-def test_run_snapshots_graph(store):
-    """run 存的是執行當時的圖快照，之後編輯工作流不影響歷史。"""
-    wf_id = store.save_workflow(GRAPH)
-    run_id = store.create_run(store.get_workflow(wf_id), "需求", workflow_id=wf_id)
+def test_run_snapshots_graph(store, tmp_path):
+    """run 存的是執行當時的圖快照，之後編輯工作流不影響歷史。
 
-    store.save_workflow({**GRAPH, "id": wf_id, "name": "後來改了",
-                         "nodes": [{"id": "z", "type": "mock", "config": {"prompt": "p"}}]})
+    工作流現在是專案資料夾裡的檔案，所以「之後被編輯」就是檔案被覆寫。
+    """
+    from store.workflows import WorkflowStore
+
+    workflows = WorkflowStore(tmp_path / "workflows")
+    wf_id = workflows.save(GRAPH)
+    run_id = store.create_run(workflows.get(wf_id), "需求", workflow_id=wf_id)
+
+    workflows.save({**GRAPH, "id": wf_id, "name": "後來改了",
+                    "nodes": [{"id": "z", "type": "mock", "config": {"prompt": "p"}}]})
 
     assert store.get_run(run_id)["graph"]["nodes"][0]["id"] == "a"
-    assert store.get_workflow(wf_id)["nodes"][0]["id"] == "z"
+    assert workflows.get(wf_id)["nodes"][0]["id"] == "z"
+
+
+def test_run_records_which_project_it_ran_on(store):
+    """多專案之後，「這個 run 在哪個 repo 上跑」必須留在紀錄裡 ——
+    算 diff 要靠它，而且專案解除註冊之後這段歷史還是要讀得懂。"""
+    run_id = store.create_run(
+        GRAPH, "需求", project_id="backend", project_path="/code/backend"
+    )
+    run = store.get_run(run_id)
+    assert run["project_id"] == "backend"
+    assert run["project_path"] == "/code/backend"
+
+
+def test_merge_runs_interleaves_projects_newest_first(tmp_path):
+    """跨專案總覽：每個專案各查一次再合併。
+
+    只從其中一個資料庫取 limit 筆的話，跑得特別頻繁的專案會把其他專案
+    完全擠掉 —— 所以是各取 limit 再合併截斷。
+    """
+    from store.stores import merge_runs
+
+    one, two = Store(tmp_path / "one.sqlite"), Store(tmp_path / "two.sqlite")
+    a = one.create_run(GRAPH, "a", project_id="one", project_path="/one")
+    time.sleep(0.01)
+    b = two.create_run(GRAPH, "b", project_id="two", project_path="/two")
+
+    merged = merge_runs([("one", one), ("two", two)], limit=10)
+    assert [r["id"] for r in merged] == [b, a]
+    assert {r["project_id"] for r in merged} == {"one", "two"}
+
+
+def test_merge_runs_respects_the_limit(tmp_path):
+    from store.stores import merge_runs
+
+    one, two = Store(tmp_path / "one.sqlite"), Store(tmp_path / "two.sqlite")
+    for _ in range(3):
+        one.create_run(GRAPH, "x", project_id="one")
+        two.create_run(GRAPH, "y", project_id="two")
+
+    assert len(merge_runs([("one", one), ("two", two)], limit=4)) == 4
 
 
 def test_node_run_upsert(store):

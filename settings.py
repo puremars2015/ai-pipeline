@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,23 +38,40 @@ class Settings:
     cleanup_worktree_on_success: bool
 
 
-def _deep_merge(base: dict, over: dict) -> dict:
+def deep_merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for key, value in over.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], value)
+            out[key] = deep_merge(out[key], value)
         else:
             out[key] = value
     return out
 
 
-def _resolve(raw: str) -> Path:
-    """展開 ~ 與環境變數，相對路徑以專案根目錄為基準。"""
+def resolve_path(raw: str, base: Path | None = None) -> Path:
+    """展開 ~ 與環境變數，相對路徑以 base（預設為本工具根目錄）為基準。
+
+    專案層的設定要以「該專案的資料夾」為基準，不是本工具的根目錄 ——
+    所以 base 是參數，不是寫死的 ROOT。
+    """
     expanded = os.path.expandvars(os.path.expanduser(str(raw)))
     path = Path(expanded)
     if not path.is_absolute():
-        path = ROOT / path
+        path = (base or ROOT) / path
     return path.resolve()
+
+
+def build_guards(raw: dict[str, Any], base: Guards | None = None) -> Guards:
+    """把一層 guards 覆蓋疊到既有的 Guards 上。
+
+    無法識別的欄位一律報錯而不是靜默忽略 —— guards 全是安全上限，
+    打錯字卻沒人講的話，使用者會以為自己調高了上限，實際上沒有。
+    """
+    unknown = set(raw) - set(Guards.__dataclass_fields__)
+    if unknown:
+        raise ConfigError(f"guards 有無法識別的欄位: {sorted(unknown)}")
+    merged = {**(dataclasses.asdict(base) if base else {}), **raw}
+    return Guards(**merged)
 
 
 def load(config_path: Path | None = None) -> Settings:
@@ -66,20 +84,14 @@ def load(config_path: Path | None = None) -> Settings:
     local_path = base_path.with_name("config.local.yaml")
     if local_path.exists():
         local = yaml.safe_load(local_path.read_text("utf-8")) or {}
-        data = _deep_merge(data, local)
-
-    guard_fields = {f for f in Guards.__dataclass_fields__}
-    raw_guards = data.get("guards") or {}
-    unknown = set(raw_guards) - guard_fields
-    if unknown:
-        raise ConfigError(f"guards 有無法識別的欄位: {sorted(unknown)}")
+        data = deep_merge(data, local)
 
     return Settings(
-        project_repo=_resolve(data.get("project_repo", "")),
+        project_repo=resolve_path(data.get("project_repo", "")),
         main_branch=data.get("main_branch", "main"),
-        worktree_root=_resolve(data.get("worktree_root", "~/ai-pipeline-worktrees")),
-        runs_dir=_resolve(data.get("runs_dir", "./runs")),
-        database=_resolve(data.get("database", "./ai-pipeline.sqlite")),
-        guards=Guards(**raw_guards),
+        worktree_root=resolve_path(data.get("worktree_root", "~/ai-pipeline-worktrees")),
+        runs_dir=resolve_path(data.get("runs_dir", "./runs")),
+        database=resolve_path(data.get("database", "./ai-pipeline.sqlite")),
+        guards=build_guards(data.get("guards") or {}),
         cleanup_worktree_on_success=bool(data.get("cleanup_worktree_on_success", False)),
     )

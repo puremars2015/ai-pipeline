@@ -17,7 +17,10 @@ from pathlib import Path
 
 import settings
 from adapters.registry import default as default_registry
+from engine import project as proj
 from engine.workspace import WorkspaceError, validate_project_repo
+from store.projects import ProjectRegistry
+from store.workflows import WorkflowStore
 
 OK = "\033[32m✓\033[0m"
 WARN = "\033[33m!\033[0m"
@@ -110,23 +113,49 @@ def check_codex_model() -> list[str]:
     return problems
 
 
-def check_repo() -> list[str]:
-    print("\n== 目標 repo ==")
+def check_projects() -> list[str]:
+    """逐一檢查已註冊的專案。
+
+    一個專案壞掉（資料夾被搬走、project.yaml 打錯字）不該讓其他專案的
+    檢查跟著中斷 —— 這支工具的用處就是一次把所有問題攤出來。
+    """
+    print("\n== 已註冊專案 ==")
     cfg = settings.load()
-    try:
-        repo = validate_project_repo(cfg.project_repo)
-    except WorkspaceError as exc:
-        print(f" {BAD} {exc}")
-        return [f"目標 repo 不可用: {cfg.project_repo}"]
-    print(f" {OK} {repo}  (基準分支 {cfg.main_branch})")
-    return []
+    entries = ProjectRegistry(cfg.database).list()
+    if not entries:
+        print(f" {WARN} 還沒有註冊任何專案。在網頁上新增，或 POST /api/projects。")
+        return []
+
+    problems: list[str] = []
+    for entry in entries:
+        try:
+            repo = validate_project_repo(entry.path)
+            resolved = proj.for_project(cfg, entry.id, entry.path, entry.name)
+        except (WorkspaceError, proj.ProjectError) as exc:
+            print(f" {BAD} {entry.id:20} {exc}")
+            problems.append(f"專案 {entry.id} 不可用: {exc}")
+            continue
+
+        mark = OK if proj.is_initialised(repo) else WARN
+        print(f" {mark} {entry.id:20} {repo}  (基準分支 {resolved.main_branch})")
+        if not proj.is_initialised(repo):
+            print(f"     還沒有 {proj.DIR_NAME}/，重新註冊一次就會建好")
+            problems.append(f"專案 {entry.id} 缺少 {proj.DIR_NAME}/")
+            continue
+
+        count = len(WorkflowStore(resolved.workflows_dir).list())
+        runs = resolved.database.exists()
+        print(f"     {count} 個工作流 @ {resolved.workflows_dir}")
+        print(f"     執行紀錄 {'有' if runs else '還沒有'} @ {resolved.database}")
+
+    return problems
 
 
 def main() -> int:
     problems: list[str] = []
     problems += check_adapters()
     problems += check_codex_model()
-    problems += check_repo()
+    problems += check_projects()
 
     print()
     if problems:

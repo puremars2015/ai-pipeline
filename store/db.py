@@ -1,4 +1,7 @@
-"""sqlite 存取層。刻意用原生 sqlite3，不引入 ORM —— 資料表只有四張。
+"""一個專案的執行紀錄存取層。刻意用原生 sqlite3，不引入 ORM —— 資料表只有三張。
+
+每個專案各有一個資料庫（<專案>/.ai-workflow-proj/local/ai-workflow.sqlite），
+由 store/stores.py 的 StoreRegistry 管理實例。
 
 執行緒安全：每個執行緒各自持有自己的連線（sqlite 連線不能跨執行緒共用）。
 引擎在背景執行緒跑、Flask 在 request 執行緒回應，兩邊都會寫，所以開 WAL 模式
@@ -15,12 +18,24 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA = Path(__file__).resolve().parent / "schema.sql"
+SCHEMA = Path(__file__).resolve().parent / "schema_project.sql"
 
 
 def new_id(prefix: str) -> str:
     """時間排序在前的短 id，方便肉眼比對與當 branch 名稱。"""
     return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def open_connection(path: Path) -> sqlite3.Connection:
+    """開一條 sqlite 連線。所有資料庫（中央註冊表、各專案的紀錄）都走這裡。
+
+    WAL 讓讀寫不互相擋 —— 引擎在背景執行緒寫、Flask 在 request 執行緒讀。
+    """
+    conn = sqlite3.connect(str(path), timeout=15, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 class Store:
@@ -34,11 +49,7 @@ class Store:
     # ------------------------------------------------------------ 連線
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=15, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        return open_connection(self.path)
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -54,42 +65,6 @@ class Store:
             existing.close()
             self._local.conn = None
 
-    # ------------------------------------------------------ workflows
-
-    def save_workflow(self, graph: dict[str, Any]) -> str:
-        wf_id = graph.get("id") or new_id("wf")
-        graph = {**graph, "id": wf_id}
-        now = time.time()
-        self.conn.execute(
-            """
-            INSERT INTO workflows (id, name, graph, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                graph = excluded.graph,
-                updated_at = excluded.updated_at
-            """,
-            (wf_id, graph.get("name") or wf_id, json.dumps(graph, ensure_ascii=False),
-             now, now),
-        )
-        return wf_id
-
-    def get_workflow(self, wf_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT graph FROM workflows WHERE id = ?", (wf_id,)
-        ).fetchone()
-        return json.loads(row["graph"]) if row else None
-
-    def list_workflows(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT id, name, updated_at FROM workflows ORDER BY updated_at DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_workflow(self, wf_id: str) -> bool:
-        cur = self.conn.execute("DELETE FROM workflows WHERE id = ?", (wf_id,))
-        return cur.rowcount > 0
-
     # ----------------------------------------------------------- runs
 
     def create_run(
@@ -97,15 +72,17 @@ class Store:
         graph: dict[str, Any],
         requirement: str,
         workflow_id: str | None = None,
+        project_id: str = "",
+        project_path: str = "",
     ) -> str:
         run_id = new_id("run")
         self.conn.execute(
             """
-            INSERT INTO runs (id, workflow_id, workflow_name, graph, requirement,
-                              status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'queued', ?)
+            INSERT INTO runs (id, workflow_id, workflow_name, project_id,
+                              project_path, graph, requirement, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
             """,
-            (run_id, workflow_id, graph.get("name") or "",
+            (run_id, workflow_id, graph.get("name") or "", project_id, project_path,
              json.dumps(graph, ensure_ascii=False), requirement, time.time()),
         )
         return run_id
@@ -135,10 +112,12 @@ class Store:
         return run
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """這個專案的執行紀錄。跨專案的總覽是 stores.merge_runs 的事。"""
         rows = self.conn.execute(
             """
-            SELECT id, workflow_id, workflow_name, requirement, status, reason,
-                   branch, steps, created_at, started_at, finished_at
+            SELECT id, workflow_id, workflow_name, project_id, project_path,
+                   requirement, status, reason, branch, steps,
+                   created_at, started_at, finished_at
             FROM runs ORDER BY created_at DESC LIMIT ?
             """,
             (limit,),

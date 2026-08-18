@@ -12,6 +12,11 @@ import { toDrawflow } from './graph.js';
 
 const $ = (s) => document.querySelector(s);
 const runId = $('[data-run-id]').dataset.runId;
+const projectId = $('[data-run-id]').dataset.projectId;
+
+// 執行紀錄存在專案自己的資料庫裡，所以每個端點都要帶專案。
+const api = (path = '') =>
+  `/api/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}${path}`;
 
 const state = {
   editor: null,
@@ -42,7 +47,7 @@ const KIND_ICON = {
 // ------------------------------------------------------------------ 啟動
 
 async function boot() {
-  const run = await fetch(`/api/runs/${runId}`).then((r) => r.json());
+  const run = await fetch(api()).then((r) => r.json());
   if (run.error) { $('#pane-timeline').textContent = run.error; return; }
 
   $('#run-name').textContent = run.workflow_name || '(未命名)';
@@ -127,7 +132,7 @@ function nodeHtml(node) {
 // ------------------------------------------------------------------ SSE
 
 function connect() {
-  const url = `/api/runs/${runId}/events` + (state.lastSeq ? `?after=${state.lastSeq}` : '');
+  const url = api('/events') + (state.lastSeq ? `?after=${state.lastSeq}` : '');
   const es = new EventSource(url);
 
   // 所有事件都走預設型別，讀 data.kind 分流。後端刻意不設 event: <kind>，
@@ -142,7 +147,7 @@ function connect() {
     es.close();
     state.finished = true;
     const final = JSON.parse(e.data);
-    const run = await fetch(`/api/runs/${runId}`).then((r) => r.json());
+    const run = await fetch(api()).then((r) => r.json());
     applyRunStatus(run);
     for (const node of run.nodes || []) {
       setNodeStatus(node.node_id, node.status);
@@ -285,7 +290,7 @@ function meta(label, value) {
 async function loadDiff() {
   const host = $('#pane-diff');
   host.innerHTML = '<span class="text-xs text-slate-500">載入中…</span>';
-  const d = await fetch(`/api/runs/${runId}/diff`).then((r) => r.json());
+  const d = await fetch(api('/diff')).then((r) => r.json());
   if (d.error) { host.textContent = d.error; return; }
   if (!d.diff) { host.innerHTML = '<span class="text-xs text-slate-500">這個 run 沒有產生任何變更。</span>'; return; }
 
@@ -312,7 +317,7 @@ function colourDiff(text) {
 
 async function loadArtifacts() {
   const host = $('#pane-artifacts');
-  const { artifacts } = await fetch(`/api/runs/${runId}/artifacts`).then((r) => r.json());
+  const { artifacts } = await fetch(api('/artifacts')).then((r) => r.json());
   if (!artifacts.length) {
     host.innerHTML = '<span class="text-xs text-slate-500">沒有產物。（QA 節點設了 schema 才會產生）</span>';
     return;
@@ -342,7 +347,7 @@ function applyRunStatus(run) {
 }
 
 $('#btn-cancel').addEventListener('click', async () => {
-  await fetch(`/api/runs/${runId}/cancel`, { method: 'POST' });
+  await fetch(api('/cancel'), { method: 'POST' });
 });
 
 function switchTab(name) {

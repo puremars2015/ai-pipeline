@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AI Workflow Builder{% endblock %}</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 每頁都要：頁首的專案選擇器就用這裡的表單樣式。
+       只有畫布相關的 drawflow.css 才留在各頁自己的 head。 -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body class="bg-slate-900 text-slate-100">
@@ -14,23 +17,27 @@
       <a href="/" class="text-slate-400 hover:text-slate-100">編輯器</a>
       <a href="/runs" class="text-slate-400 hover:text-slate-100">執行紀錄</a>
     </nav>
-    <span id="repo-status" class="ml-auto text-sm text-slate-400">檢查中…</span>
+    <div id="project-bar" class="ml-auto flex min-w-0 items-center gap-2">
+      <span class="text-xs text-slate-500">載入中…</span>
+    </div>
   </header>
+
+  <dialog id="project-dialog"
+          class="w-[34rem] max-w-[92vw] rounded-lg border border-slate-700 bg-slate-900 p-0 text-slate-100 backdrop:bg-black/60">
+    <form method="dialog" class="flex items-center justify-between border-b border-slate-700 px-4 py-2.5">
+      <span class="text-sm font-medium">專案管理</span>
+      <button class="rounded px-2 text-slate-400 hover:text-slate-100" aria-label="關閉">✕</button>
+    </form>
+    <div id="project-dialog-body" class="max-h-[70vh] overflow-y-auto p-4"></div>
+  </dialog>
 
   <main>{% block content %}
     <p class="p-4 text-slate-400">編輯器在 P4 實作。</p>
   {% endblock %}</main>
 
-  <script>
-    fetch('/api/health').then(r => r.json()).then(d => {
-      const el = document.getElementById('repo-status');
-      el.textContent = d.project_repo.ok
-        ? `目標 repo: ${d.project_repo.path} (${d.main_branch})`
-        : `⚠ ${d.project_repo.error.split('\n')[0]}`;
-      el.className = d.project_repo.ok
-        ? 'text-sm text-emerald-400'
-        : 'text-sm text-amber-400';
-    });
+  <script type="module">
+    import { mountPicker } from "{{ url_for('static', filename='js/project.js') }}";
+    await mountPicker();
   </script>
   {% block scripts %}{% endblock %}
 </body>
