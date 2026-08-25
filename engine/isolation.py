@@ -5,6 +5,7 @@
 **shared**（預設）
   整個 run 一個 worktree，所有節點接力。會寫檔的節點搶同一把寫入鎖，實際是
   序列化的；只有唯讀節點真的平行。簡單、直觀、diff 一路累積。
+  節點之間不 commit，整個 run 跑完由 service 收尾 commit 到 task/<run-id>。
 
 **per_node**
   每個節點自己的 worktree + branch，從上游節點的產出 commit 開始。
@@ -86,7 +87,9 @@ class SharedIsolation:
         return self._lock.locked()
 
     def needs_autocommit(self) -> bool:
-        # 共用模式下要不要 commit 由使用者用 git 節點明確決定
+        # 共用模式下節點之間靠同一個工作目錄接力，中途要不要 commit 由使用者
+        # 用 git 節點決定。整個 run 的成果則由 service 在收尾時 commit 上
+        # task/<run-id>，不然 branch 會空著、worktree 一清成果就沒了。
         return False
 
     def cleanup(self) -> None:

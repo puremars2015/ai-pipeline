@@ -456,6 +456,7 @@ async function save({ asNew = false } = {}) {
   status(body.problems.length ? `${what}，但有 ${body.problems.length} 個問題` : what,
          body.problems.length ? 'warn' : 'ok');
   showProblems(body.problems);
+  return body.id;
 }
 
 /** 清空畫布，開一個新的工作流。 */
@@ -509,11 +510,23 @@ function showProblems(problems) {
 
 async function run() {
   if (!(await validate())) { status('先修掉上面的問題再執行', 'bad'); return; }
+
+  // 執行前先存檔。run 自己會存一份快照，但快照在執行紀錄裡、不在
+  // .ai-workflow-proj/workflows/ —— 只按執行的人畫完一張圖跑完就沒了，
+  // 下次進編輯器是空白畫布。存檔失敗就不要跑：使用者會以為已經存好了。
+  if (state.dirty || !state.workflowId) {
+    if (!(await save())) return;
+  }
+
   const requirement = $('#requirement').value.trim();
   const resp = await fetch(`/api/projects/${encodeURIComponent(state.project.id)}/runs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ graph: currentGraph(), requirement }),
+    body: JSON.stringify({
+      graph: currentGraph(),
+      requirement,
+      workflow_id: state.workflowId,
+    }),
   });
   const body = await resp.json();
   if (!resp.ok) { status(body.error, 'bad'); return; }

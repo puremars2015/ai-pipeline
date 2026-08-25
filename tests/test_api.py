@@ -245,6 +245,80 @@ def test_run_end_to_end(app_ctx):
     assert f"task/{run_id}" in branches, "branch 要留著給人工檢查與合併"
 
 
+def test_shared_run_commits_its_output_to_the_run_branch(app_ctx):
+    """跑完之後，agent 寫出來的檔案必須留在 task/<run-id> 上。
+
+    這是「有執行過程卻沒有產出」的來源：shared 模式節點之間不 commit，
+    工作流裡又沒有 git 節點時，成果只存在 worktree 裡 —— branch 還停在
+    main，照著「可合併」的提示做只會得到 Already up to date，而
+    cleanup_worktree_on_success（這個 fixture 開著）會把那個目錄連同
+    整份成果直接刪掉。
+    """
+    client, _, repo = app_ctx
+    run_id = client.post(
+        RUNS,
+        json={"graph": mock_graph(message="做完了", files={"game.js": "let snake\n"}),
+              "requirement": "寫一個貪食蛇小遊戲"},
+    ).get_json()["run_id"]
+    final = wait_for(client, run_id)
+    assert final["status"] == "passed", final["reason"]
+
+    show = subprocess.run(
+        ["git", "show", f"task/{run_id}:game.js"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert show.returncode == 0, f"branch 上沒有這個檔案: {show.stderr}"
+    assert "let snake" in show.stdout
+
+    # 而且真的合得進去 —— 這是使用者最後會做的那一步
+    merged = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", f"task/{run_id}"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert merged.returncode == 0, merged.stderr
+    assert (repo / "game.js").read_text("utf-8") == "let snake\n"
+
+
+def test_run_without_changes_does_not_claim_it_can_be_merged(app_ctx):
+    """純唯讀的流程也算成功，但收尾訊息不能說「可合併」。
+
+    照著一個不存在的成果去 merge，得到的是 Already up to date，
+    使用者只會以為東西弄丟了。
+    """
+    client, _, repo = app_ctx
+    run_id = client.post(
+        RUNS, json={"graph": mock_graph(message="只看不改"), "requirement": "看一下"}
+    ).get_json()["run_id"]
+    assert wait_for(client, run_id)["status"] == "passed"
+
+    events, _ = read_sse(client, run_id)
+    end = events[-1]
+    assert end["data"]["phase"] == "run_end"
+    assert "可合併" not in end["text"], end["text"]
+    assert "沒有任何檔案變更" in end["text"]
+
+    same = subprocess.run(
+        ["git", "rev-parse", f"task/{run_id}", "main"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout.split()
+    assert same[0] == same[1], "沒有變更時 branch 不該多出 commit"
+
+
+def test_git_node_commit_is_not_duplicated_by_the_final_commit(app_ctx):
+    """工作流自己用 git 節點 commit 過的話，收尾不該再多一個空 commit。"""
+    client, _, repo = app_ctx
+    run_id = client.post(
+        RUNS, json={"graph": _committing_graph("done.txt", "hi"), "requirement": "r"}
+    ).get_json()["run_id"]
+    assert wait_for(client, run_id)["status"] == "passed"
+
+    subjects = subprocess.run(
+        ["git", "log", "--format=%s", f"main..task/{run_id}"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout.split("\n")
+    assert [s for s in subjects if s] == ["test commit"], subjects
+
+
 def test_run_rejects_invalid_graph(app_ctx):
     client, _, _ = app_ctx
     resp = client.post(

@@ -268,6 +268,11 @@ class RunService:
             )
             result = runner.run()
 
+            # run 的成果最終要落在 task/<run-id> 上，兩種隔離模式的收尾方式不同。
+            # final_commit 是 None 就代表這個 run 沒有留下任何東西 —— 收尾訊息
+            # 必須照實說，不能一律宣告「已就緒可合併」。
+            final_commit: str | None = None
+
             # per_node 模式下每個節點各有 branch，task/<run-id> 要代表整個 run
             # 的完整結果，否則「變更」分頁與合併指令會漏掉某些分支的成果。
             if isinstance(isolation, PerNodeIsolation) and result.status == PASSED:
@@ -281,21 +286,59 @@ class RunService:
                     emit_raw(ERROR, result.reason, phase="run_integrate")
                 else:
                     if final:
+                        final_commit = final
                         emit_raw(
                             STATUS,
                             f"{branch} → {final[:12]}"
                             f"（各節點的結果也留在 node/{run_id}/<node-id>）",
                             phase="run_branch", branch=branch, commit=final,
                         )
+            elif workspace is not None and result.status == PASSED:
+                # shared 模式：整個 run 共用一個 worktree，節點跑完不會自動
+                # commit。收尾時把剩下的變更整包 commit 上去，否則 agent 真的
+                # 寫出來的檔案只會留在 worktree 裡：branch 還停在 base，
+                # 「可合併」是假的，而 cleanup_worktree_on_success 開著時
+                # 那個目錄會連同整份成果被直接刪掉。
+                #
+                # 工作流裡已經有 git 節點自己 commit 過的話，這裡沒有變更可存，
+                # commit() 回 None，branch 仍然指在那個節點的成果上。
+                try:
+                    sha = workspace.commit(f"run {run_id} 的結果")
+                except WorkspaceError as exc:
+                    result.status = FAILED
+                    result.reason = f"收尾 commit 失敗: {exc}"
+                    emit_raw(ERROR, result.reason, phase="run_commit")
+                else:
+                    if sha:
+                        emit_raw(
+                            STATUS,
+                            f"收尾 commit {sha[:12]} → {branch}",
+                            phase="run_commit", branch=branch, commit=sha,
+                        )
+                    head = workspace.head()
+                    final_commit = head if head != base_sha else None
 
             self._persist_nodes(store, run_id, graph, ctx, result)
             store.finish_run(run_id, result.status, result.reason, result.steps)
 
-            if result.status == PASSED:
+            if result.status == PASSED and final_commit:
                 emit_raw(
                     STATUS,
-                    f"✅ 完成。branch {branch} 已就緒，"
+                    f"✅ 完成。branch {branch}（{final_commit[:12]}）已就緒，"
                     f"人工檢查後可合併：git merge --no-ff {branch}",
+                    phase="run_end",
+                    status=result.status,
+                    branch=branch,
+                    commit=final_commit,
+                )
+            elif result.status == PASSED:
+                # 沒有檔案變更也算成功（純唯讀的分析流程就是這樣），但絕不能
+                # 講成「可以合併」—— 使用者照著做只會得到 Already up to date，
+                # 然後以為成果不見了。
+                emit_raw(
+                    STATUS,
+                    f"✅ 完成，但沒有任何檔案變更 —— branch {branch} 還停在 "
+                    f"{base_sha[:12]}，沒有東西可以合併。",
                     phase="run_end",
                     status=result.status,
                     branch=branch,
